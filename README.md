@@ -44,6 +44,12 @@ Kindle 的蓝牙栈只注册了 A2DP/HFP 音频 profile，没有 SPP 串口服�
 
 ## 安装
 
+**方式一：下载打包好的 zip**（推荐）
+
+到 [Releases](../../releases) 下载最新的 `kremote.koplugin.zip`，解压出的 `kremote.koplugin` 文件夹整个放进 KOReader 的 `plugins/` 目录，重启 KOReader。
+
+**方式二：git clone**
+
 把整个目录放到 KOReader 的 `plugins/` 下，目录名必须保持 `kremote.koplugin`：
 
 ```bash

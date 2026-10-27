@@ -169,6 +169,43 @@ local function activeReader()
     return nil
 end
 
+-- 觅阅（MiuRead）桌面支持
+--
+-- 这台机器上的 KOReader 装了 miuread.koplugin，它在 FileManager 之上加了一
+-- 层自己的 HomeView「觅阅桌面」，并把 ReaderUI:onHome / showFileManager 换成了
+-- "回觅阅桌面"的版本。
+--
+-- 我们如果直接 ReaderUI:onClose()，就绕过了它那层改写：阅读界面一关，觅阅
+-- 桌面先闪一下，原生 FileManager 随即被建出来并盖上去 —— 用户看到的就是
+-- "先显示觅阅桌面，然后又进入 KOReader 的文件浏览器"。
+--
+-- 所以退到书架时要优先走觅阅自己的 return_to_miuread_home()，让它来做
+-- "关文档 → 建 FileManager 底 → 把桌面抬回来"这一整套。没装觅阅时退回
+-- ReaderUI:onHome()，也就是原版 KOReader 的"关文档回文件浏览器"。
+local function miuReadPlugin()
+    local ok, loader = pcall(require, "pluginloader")
+    if not ok or type(loader) ~= "table" then return nil end
+    local loaded = loader.loaded_plugins
+    if type(loaded) ~= "table" then return nil end
+    for _, inst in pairs(loaded) do
+        if type(inst) == "table" and type(inst.return_to_miuread_home) == "function" then
+            return inst
+        end
+    end
+    return nil
+end
+
+-- 觅阅桌面此刻是否显示着。它底下通常还压着一个 FileManager，所以这可以
+-- 当作"界面还在，别停服务"的依据。
+local function miuHomeShown()
+    local ok, mod = pcall(require, "miuread.home_view")
+    if not ok or type(mod) ~= "table" or type(mod.is_shown) ~= "function" then
+        return false
+    end
+    local ok2, shown = pcall(mod.is_shown)
+    return ok2 and shown == true
+end
+
 -- 把手机发来的动作记为一次"用户操作"。
 -- 只重置 AutoSuspend 的计时，不动 pause_auto_suspend：不操作照样会睡，
 -- 但正在用手机翻页时不会因为"手指没碰屏幕"而中途休眠。
@@ -304,14 +341,20 @@ function KRemote:onCloseWidget()
     -- 随后才重建出来。这里立刻 stopServer 会让手机端断两三秒（实测端口
     -- 关了又开），期间的轮询全部打空。所以延后 4 秒再停，期间只要有界面
     -- 重新登记（见 init）就取消。
-    if not SERVER.reader_ui and not SERVER.fm_ui and not SERVER.stop_task then
-        SERVER.stop_task = UIManager:scheduleIn(4, function()
+    --
+    -- 装了觅阅时还要多等：退回觅阅桌面后，底下的 FileManager 是觅阅自己
+    -- 异步建出来再给它垫背的，这中间同样没有界面登记。桌面还在显示就说明
+    -- KOReader 没退，接着等下一轮，别把端口关了。
+    local function arm(delay)
+        if SERVER.stop_task then return end
+        SERVER.stop_task = UIManager:scheduleIn(delay or 4, function()
             SERVER.stop_task = nil
-            if not SERVER.reader_ui and not SERVER.fm_ui then
-                self:stopServer(true)
-            end
+            if SERVER.reader_ui or SERVER.fm_ui then return end
+            if miuHomeShown() then return arm(4) end
+            self:stopServer(true)
         end)
     end
+    if not SERVER.reader_ui and not SERVER.fm_ui then arm(4) end
 end
 
 function KRemote:onResume()
@@ -446,7 +489,8 @@ local function scheduleOpenBook(path)
                     fm:openFile(path)
                     return
                 end
-                require("apps/reader/readerui"):showDocument(path)
+                -- 觅阅桌面状态下不一定有 FileManager 实例，直接起阅读界面
+                require("apps/reader/readerui"):showReader(path)
             end)
         end
         if not ok then
@@ -456,15 +500,30 @@ local function scheduleOpenBook(path)
     return true
 end
 
--- 关掉当前文档，退回书架（FileManager 一直在窗口栈下面，关掉就露出来）
+-- 关掉当前文档，退回书架
+--
+-- 装了觅阅时"书架"就是它的桌面，必须走 miuread 自己的返回流程，否则会
+-- 越过它落到原生的文件浏览器（见 miuReadPlugin 上面的说明）。
 local function scheduleCloseToShelf()
     if not activeReader() then return true end
     UIManager:scheduleIn(0.35, function()
         local ui = activeReader()
         if not ui then return end
-        -- onCloseDocument 只注销 reader_ui 登记，不会停 HTTP 服务
-        local ok, err = pcall(ui.onClose, ui, true)
-        if not ok then logger.warn("kremote: onClose failed", tostring(err)) end
+        local miu = miuReadPlugin()
+        if miu then
+            local ok, done = pcall(miu.return_to_miuread_home, miu, "kremote")
+            if ok and done ~= false then
+                logger.info("kremote: back to MiuRead home")
+                return
+            end
+            logger.warn("kremote: MiuRead return unavailable", tostring(done))
+        end
+        -- 原版 KOReader：onHome 会关文档并回到 FileManager（它没有桌面层）
+        local ok, err = pcall(ui.onHome, ui)
+        if not ok then
+            logger.warn("kremote: onHome failed, closing reader", tostring(err))
+            pcall(ui.onClose, ui, true)
+        end
     end)
     return true
 end

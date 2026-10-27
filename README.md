@@ -32,6 +32,8 @@ Kindle 的蓝牙栈只注册了 A2DP/HFP 音频 profile，没有 SPP 串口服�
 | 系统 | 重启 KOReader、退出 KOReader |
 | 菜单 | 启动/停止服务、显示访问地址、开机自动启动 |
 
+> 装了「觅阅」（MiuRead）这类带自己桌面的定制版时，手机点返回会让 Kindle 回到**觅阅桌面**，而不是 KOReader 的文件浏览器——返回动作走的是觅阅自己的 `return_to_miuread_home()`，它负责关文档、重建底下的 FileManager、再把桌面抬回来。原版 KOReader 没有这层桌面，返回的仍然是文件管理器。
+
 **做不到的**
 
 - **音量、朗读**：设备没有扬声器（能读到音频设备不代表能发声）

@@ -142,7 +142,10 @@ iptables -I INPUT 1 -i wlan0 -p tcp --dport 18080 -m conntrack --ctstate NEW -j 
 - **亮度**走 `Device:getPowerDevice():setIntensity(n)`，不直接写 `/sys/class/backlight`。直接写 sysfs 会让 KOReader 记录的档位和硬件实际值脱节，下次它恢复亮度时会把你的设置覆盖掉。
 - **常驻插件**：没有设 `is_doc_only = true`，所以书架和阅读界面各会加载一份实例。两份实例通过模块级的 `SERVER` 表共享同一个服务，避免重复 `bind` 端口。动作按"当前是否有打开的文档"派发。
 - **不干预自动休眠**：不设置 `PluginShare.pause_auto_suspend`。Kindle 按自己的 30 分钟超时休眠，省电。但手机发来的**动作**（翻页、调亮度等）会计为一次用户操作，重置 AutoSuspend 的计时——否则你正用手机连续翻页，手指没碰屏幕，设备会中途睡过去。**纯 `/api/status` 轮询不算**，所以放下手机 30 分钟照样休眠。
-- **重启**不调用 `UIManager:restartKOReader()`。那实质是 `quit(85)`，依赖启动脚本看到 85 后重新拉起，而 Kindle 的 `koreader.sh` 末尾是 `exit ${RETURN_VALUE}`，没有这个循环——所以官方那条路在 Kindle 上只会退出。插件改成退出后由后台 shell 用 `kpm launch` 重新拉起。
+- **重启**直接走 `UIManager:restartKOReader()`，也就是退出码 85。`koreader.sh` 里有 `while [ $RETURN_VALUE -eq 85 ]` 循环，
+  会原地重新拉起 `reader.lua`，同时框架保持停止、插件全部重新加载。
+  早先试过"退出再用 `kpm launch --asap` 从外部拉起"，在 Kindle 上不可靠：`reader.lua` 一退出 `koreader.sh` 就结束、
+  Amazon 框架随即恢复，这时再启动 KOReader 等于跑在框架底下，会被抢焦点甚至直接收掉。
 
 ## 测试
 
@@ -180,6 +183,9 @@ python3 tests/mock_shelf.py
 
 ## 已知限制
 
+- **Kindle 商店的 `.azw/.azw3` 取不到封面**。DRM 保护的文件解不出封面页，书架里这些书显示书名首字占位，其余照常可用。
+- **封面质量**：优先用 CoverBrowser 已经缩好的缓存；缓存里的图太小时（实测有些只有 47×62，手机上会糊）会现场开文档抽一次原图，
+  再缩到 260px 宽存成 JPEG。所以第一次翻到某本书时可能要等一两秒，之后走磁盘缓存，几十毫秒。
 - **无鉴权**。同一 Wi-Fi 下任何人知道 IP 就能翻你的书。自己家里用没问题，公共网络下建议改成手动启动而不是自动启动。要加 token 鉴权的话，改动很小。
 - **休眠后连不上**。Kindle 休眠会断 Wi-Fi，碰一下设备唤醒即可，服务会跟着进程一起回来（`onResume` 会补防火墙规则）。这条路径在真实休眠/唤醒循环下的表现还没做过严格验证。
 - **只覆盖 KOReader**。原生阅读器界面不归它管。

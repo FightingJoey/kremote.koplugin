@@ -74,7 +74,9 @@ button:active{background:#2f343b;transform:scale(.975)}
   display:block;z-index:1}
 .bk .nm{flex:0 0 auto;font-size:11px;line-height:1.3;margin-top:5px;color:#d7d5d0;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
-  min-height:2.6em}
+  /* 固定两行高（不是 min-height）：一行和两行的书名必须占同样高度，
+     否则下面的进度行会差几像素、整排看着不齐 */
+  height:2.6em}
 .bk .pg{flex:0 0 auto;font-size:10px;color:#6fa8c8;margin-top:2px;
   font-variant-numeric:tabular-nums}
 
@@ -606,6 +608,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
   function tick(){
     if (S.view !== 'reader') return;
     api('/api/status').then(function(s){
+      S.fails = 0;
       if (!s) return;
       S.kindleView = s.view;
       // 正在开书：Kindle 还没切过去，这时 status 仍是 shelf，
@@ -619,7 +622,13 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
         return;
       }
       paint(s);
-    }).catch(offline);
+    }).catch(function(){
+      // 单次失败不算断线：退回书架 / 开书时 Kindle 要重建整个书架界面，
+      // HTTP 服务可能跟着重启一两秒（实测 1~3 秒），这时请求会打空。
+      // 连续失败 3 次（约 6 秒）才认定真的连不上。
+      S.fails = (S.fails || 0) + 1;
+      if (S.fails >= 3) offline();
+    });
   }
 
   function pollShelfState(){

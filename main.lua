@@ -156,6 +156,7 @@ end
 local SERVER = {
     http = nil,
     loop_task = nil,
+    stop_task = nil,  -- 延迟停服务的定时任务（界面重建期间会短暂出现"两份界面都没了"）
     fw_owned = false,
     fm_ui = nil,      -- 书架界面（FileManager）
     reader_ui = nil,  -- 阅读界面（ReaderUI）
@@ -213,10 +214,18 @@ local ACTIONS = {
     -- 在这里同步执行会让手机收到连接重置，看不到任何结果
     restart = function()
         UIManager:scheduleIn(0.6, function()
-            -- Kindle 的 koreader.sh 末尾是 exit ${RETURN_VALUE}，没有对退出码 85
-            -- 的重启循环，所以 UIManager:restartKOReader()（实质是 quit(85)）
-            -- 在这台机器上只会退出、不会重启。改成交给后台 shell 重新拉起。
-            os.execute("nohup sh -c 'sleep 4; /var/local/kmc/bin/kpm launch koreader --asap' "
+            -- koreader.sh 里有 `while [ RETURN_VALUE -eq 85 ]` 循环，quit(85) 会被它
+            -- 接住、原地重新起 reader.lua，框架保持停止、插件全部重新加载。
+            --
+            -- 之前试过"先 quit 再用 kpm launch --asap 外部拉起"，在 Kindle 上不可靠：
+            -- reader.lua 一退出 koreader.sh 就结束了，Amazon 框架随即恢复，这时再拉
+            -- KOReader 等于跑在框架底下，会被抢焦点甚至直接被收掉。
+            if type(UIManager.restartKOReader) == "function" then
+                local ok = pcall(function() UIManager:restartKOReader() end)
+                if ok then return end
+            end
+            -- 兜底：直接退出，让调用方自己决定怎么再起来
+            os.execute("nohup sh -c 'sleep 4; /var/local/kmc/bin/kpm launch koreader --framework_stop' "
                 .. ">/dev/null 2>&1 &")
             UIManager:quit()
         end)
@@ -260,6 +269,11 @@ function KRemote:init()
     else
         SERVER.fm_ui = self.ui
     end
+    -- 有界面重新登记了，说明刚才是"关文档 → 重建书架"的中间态，别停服务
+    if SERVER.stop_task then
+        pcall(function() UIManager:unschedule(SERVER.stop_task) end)
+        SERVER.stop_task = nil
+    end
     self.ui.menu:registerToMainMenu(self)
     if autoStart() then
         -- init 阶段 UIManager 还没开始处理事件，延一会儿再起服务
@@ -284,9 +298,19 @@ end
 function KRemote:onCloseWidget()
     if SERVER.reader_ui == self.ui then SERVER.reader_ui = nil end
     if SERVER.fm_ui == self.ui then SERVER.fm_ui = nil end
-    -- 两份界面都注销了说明 KOReader 正在退出，这时才真正停服务
-    if not SERVER.reader_ui and not SERVER.fm_ui then
-        self:stopServer(true)
+    -- 两份界面都注销了，通常意味着 KOReader 要退出，该停服务。
+    --
+    -- 但"从书里退回书架"也会短暂走到这个状态：阅读界面先关，书架界面
+    -- 随后才重建出来。这里立刻 stopServer 会让手机端断两三秒（实测端口
+    -- 关了又开），期间的轮询全部打空。所以延后 4 秒再停，期间只要有界面
+    -- 重新登记（见 init）就取消。
+    if not SERVER.reader_ui and not SERVER.fm_ui and not SERVER.stop_task then
+        SERVER.stop_task = UIManager:scheduleIn(4, function()
+            SERVER.stop_task = nil
+            if not SERVER.reader_ui and not SERVER.fm_ui then
+                self:stopServer(true)
+            end
+        end)
     end
 end
 

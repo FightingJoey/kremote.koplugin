@@ -54,7 +54,6 @@ local COVER_WIDTH = 260    -- 封面目标宽度（像素），手机端显示�
 ----------------------------------------------------------------------
 
 local BIM   -- BookInfoManager：封面/元数据 SQLite 缓存
-local BFI   -- FileManagerBookInfo：现场抽封面的工具
 local BL    -- BookList：阅读进度缓存
 
 local function tryRequire(name)
@@ -66,10 +65,15 @@ end
 local function loadFromDisk(relpath)
     local ok, base = pcall(function() return DataStorage:getDataDir() end)
     if not ok or type(base) ~= "string" then return nil end
-    local chunk = loadfile(base .. "/" .. relpath)
-    if not chunk then return nil end
-    local ok2, m = pcall(chunk)
-    if ok2 and type(m) == "table" then return m end
+    -- KOReader 的 Lua 代码在 frontend/ 下面，而 DataDir 是它的上级，
+    -- 两个位置都试一遍，省得不同发行版目录布局不同就加载不到
+    for _, p in ipairs({ base .. "/" .. relpath, base .. "/frontend/" .. relpath }) do
+        local chunk = loadfile(p)
+        if chunk then
+            local ok2, m = pcall(chunk)
+            if ok2 and type(m) == "table" then return m end
+        end
+    end
     return nil
 end
 
@@ -79,14 +83,6 @@ local function getBIM()
         or loadFromDisk("plugins/coverbrowser.koplugin/bookinfomanager.lua")
         or false
     return BIM or nil
-end
-
-local function getBFI()
-    if BFI ~= nil then return BFI or nil end
-    BFI = tryRequire("apps/filemanager/filemanagerbookinfo")
-        or loadFromDisk("apps/filemanager/filemanagerbookinfo.lua")
-        or false
-    return BFI or nil
 end
 
 local function getBookList()
@@ -152,6 +148,21 @@ local function getCacheDir()
     end
     if lfs.attributes(dir, "mode") == "directory" then
         cache_dir = dir
+        -- 旧版本缓存没有质量前缀（当年直接存的是 CoverBrowser 的 47x62 缩略图），
+        -- 留在磁盘上会被当成有效缓存一直返回糊图。第一次进来清一遍。
+        local marker = dir .. "/.v2"
+        if not lfs.attributes(marker, "modification") then
+            local okd, iter, state = pcall(lfs.dir, dir)
+            if okd and iter then
+                for fn in iter, state do
+                    if fn ~= "." and fn ~= ".." and not fn:match("^v2%-") then
+                        pcall(os.remove, joinPath(dir, fn))
+                    end
+                end
+            end
+            local mf = io.open(marker, "w")
+            if mf then mf:write("2") mf:close() end
+        end
         return dir
     end
     cache_dir = false
@@ -227,6 +238,11 @@ local function makeBook(path)
     end
 
     if type(title) ~= "string" or title == "" then title = basename(path) end
+    -- Kindle 下载的书名常带 "_E4B31437D30746AE..." 这种 32 位哈希后缀。
+    -- 不用 {16,} 量词：某些 Lua 实现里 `{n,}` 配 `$` 表现不一致，直接取尾段判长度更稳。
+    local base, tail = title:match("^(.-)_([%x]+)%s*$")
+    if base and #base > 0 and #tail >= 16 then title = base end
+    if title == "" then title = basename(path) end
     if type(authors) ~= "string" then authors = "" end
 
     local pct = getPercent(path)
@@ -250,8 +266,32 @@ end
 -- 目录扫描
 ----------------------------------------------------------------------
 
+-- Kindle 系统文件 / 越狱残留：后缀合我们的白名单，但不是书，
+-- 扫进来手机书架上会显示成"index""JAILBROKEN"这种莫名其妙的东西
+local SKIP_NAMES = {
+    ["my clippings"] = true,
+    ["jailbroken"] = true,
+    ["spidercat"] = true,
+    ["config"] = true,
+    ["index"] = true,
+}
+
+-- 太小的东西基本不是书（系统说明文件才几百字节）
+local MIN_SIZE = 8192
+
 local function skipDir(name)
-    return name:sub(1, 1) == "." or name:sub(-4) == ".sdr"
+    if name:sub(1, 1) == "." or name:sub(-4) == ".sdr" then return true end
+    -- kpomo 之类是插件自带的网页资源目录
+    return name == "kpomo" or name == "extensions"
+end
+
+local function isBookFile(entry, full)
+    local ext = extOf(entry)
+    if not ext or not EXTS[ext] then return false end
+    if SKIP_NAMES[basename(entry):lower()] then return false end
+    local size = lfs.attributes(full, "size")
+    if type(size) == "number" and size < MIN_SIZE then return false end
+    return true
 end
 
 local function walk(dir, out, depth)
@@ -266,24 +306,40 @@ local function walk(dir, out, depth)
             if mode == "directory" then
                 if not skipDir(entry) then walk(full, out, depth + 1) end
             elseif mode == "file" then
-                local ext = extOf(entry)
-                if ext and EXTS[ext] then out[#out + 1] = full end
+                if isBookFile(entry, full) then out[#out + 1] = full end
             end
         end
     end
+end
+
+-- 书库根目录，按可能性依次试。
+--
+-- 不能只拿 DataDir.."/documents" 兜底：Kindle 上 DataDir 是 /mnt/us/koreader，
+-- 拼出来是 /mnt/us/koreader/documents，这个目录根本不存在，结果就是空书库。
+-- 真实的书在 /mnt/us/documents。
+local function dirExists(p)
+    return type(p) == "string" and p ~= "" and lfs.attributes(p, "mode") == "directory"
 end
 
 local function getHomeDir()
     local ok, dir = pcall(function()
         return G_reader_settings:readSetting("home_dir")
     end)
-    if ok and type(dir) == "string" and dir ~= ""
-        and lfs.attributes(dir, "mode") == "directory" then
-        return dir
-    end
+    if ok and dirExists(dir) then return dir end
+
     local okd, base = pcall(function() return DataStorage:getDataDir() end)
-    if not okd or type(base) ~= "string" then return nil end
-    return joinPath(base, "documents")
+    if okd and type(base) == "string" then
+        local cand = joinPath(base, "documents")
+        if dirExists(cand) then return cand end
+        local parent = base:match("^(.*)/[^/]+$")
+        if parent then
+            cand = joinPath(parent, "documents")
+            if dirExists(cand) then return cand end
+        end
+    end
+
+    if dirExists("/mnt/us/documents") then return "/mnt/us/documents" end
+    return nil
 end
 
 ----------------------------------------------------------------------
@@ -387,37 +443,72 @@ local function ctypeOf(data)
     return "image/jpeg"
 end
 
--- 从 CoverBrowser 的 SQLite 里取封面 BlitBuffer；没有就现场抽一张
+-- CoverBrowser 的缓存封面是按它自己当时的显示模式缩过的，实测有相当一部分
+-- 只有 47x62 —— 手机上要显示 112 CSS px，用这些会糊成一片。低于这个宽度
+-- 就当作没有，转去现场抽原图。
+local MIN_DB_COVER_W = 150
+
+-- 现场抽封面原图：开文档 -> 取封面 -> 关文档。
+-- 一本书几百毫秒到两三秒，所以只在"缓存里没有 / 缓存太小"时才走，
+-- 结果按书文件 mtime 落盘，同一本书只会慢这一次。
+local function extractCover(path)
+    local DocumentRegistry = tryRequire("document/documentregistry")
+        or loadFromDisk("document/documentregistry.lua")
+    if not DocumentRegistry then return nil end
+
+    -- 用户手动设过自定义封面就优先用那张
+    local target = path
+    local okds, DocSettings = pcall(require, "docsettings")
+    if okds and DocSettings then
+        local okf, custom = pcall(function() return DocSettings:findCustomCoverFile(path) end)
+        if okf and type(custom) == "string" and custom ~= "" then target = custom end
+    end
+
+    local okopen, doc = pcall(DocumentRegistry.openDocument, DocumentRegistry, target)
+    if not okopen or not doc then return nil end
+
+    -- CreDocument 要先 loadDocument(false) 才拿得到封面页
+    if type(doc.loadDocument) == "function" then
+        pcall(doc.loadDocument, doc, false)
+    end
+    local okcov, cov = pcall(doc.getCoverPageImage, doc)
+    pcall(doc.close, doc)
+    if okcov and cov ~= nil then return cov end
+    return nil
+end
+
+-- 取封面 BlitBuffer：优先用 CoverBrowser 缓存（快），太小或没有就现场抽
 local function getCoverBB(path)
     local bim = getBIM()
     if bim then
         local ok, info = pcall(bim.getBookInfo, bim, path, true)
         if ok and type(info) == "table" then
             if info.ignore_cover == "Y" then return nil end
-            if info.cover_bb then return info.cover_bb end
-            if info.has_cover == "Y" then
-                -- 库里有标记但 BLOB 没解出来，交给下方现场抽取兜底
-            elseif info.cover_fetched == "Y" then
-                -- 已经试过且没有封面，不用再浪费时间
+            local bb = info.cover_bb
+            if bb then
+                local okw, w = pcall(bb.getWidth, bb)
+                if okw and type(w) == "number" and w >= MIN_DB_COVER_W then
+                    return bb
+                end
+                -- 太小：继续往下抽原图（有原始尺寸信息就不再白跑一趟）
+                if info.cover_sizetag then
+                    local ow = tonumber(info.cover_sizetag:match("^(%d+)x"))
+                    if ow and ow < MIN_DB_COVER_W then return bb end
+                end
+            elseif info.has_cover ~= "Y" and info.cover_fetched == "Y" then
+                -- 已经试过且确认没有封面
                 return nil
             end
         end
     end
-
-    -- 现场抽取。只对"还没有记录"的书走到这里，抽完落盘缓存，下次不再走。
-    local bfi_mod = getBFI()
-    if not bfi_mod then return nil end
-    local ok2, inst = pcall(function() return bfi_mod:new{} end)
-    if not ok2 or not inst then return nil end
-    local ok3, bb = pcall(inst.getCoverImage, inst, nil, path)
-    if ok3 then return bb end
-    return nil
+    return extractCover(path)
 end
 
 --- 返回 图片二进制, content_type；失败返回 nil
 function Library.cover(path)
     if type(path) ~= "string" or path == "" then return nil end
     local hash = hashPath(path)
+    local ckey = "v2-" .. hash   -- 磁盘缓存文件名带版本，旧的低质量缓存不再命中
 
     local cached = cover_mem[hash]
     if cached then return cached, ctypeOf(cached) end
@@ -426,7 +517,7 @@ function Library.cover(path)
 
     -- 磁盘缓存：命中就直接回，省掉一次 zstd 解压 + 缩放 + 编码
     if dir then
-        local cache_path = findCacheFile(dir, hash)
+        local cache_path = findCacheFile(dir, ckey)
         if cache_path and cacheFresh(cache_path, path) then
             local data = readFile(cache_path)
             if data and #data > 0 then
@@ -454,7 +545,7 @@ function Library.cover(path)
 
     local data
     if dir then
-        local tmp = joinPath(dir, hash .. ".tmp")
+        local tmp = joinPath(dir, ckey .. ".tmp")
         -- 先 JPEG（体积小、编码快），失败退 PNG（无损但更大）
         for _, ext in ipairs({ "jpg", "png" }) do
             pcall(os.remove, tmp)
@@ -462,9 +553,9 @@ function Library.cover(path)
             if oke and done then
                 local got = readFile(tmp)
                 if got and #got > 0 then
-                    local target = joinPath(dir, hash .. "." .. ext)
+                    local target = joinPath(dir, ckey .. "." .. ext)
                     -- 另一种格式的旧文件可能还在，清掉免得 findCacheFile 读错
-                    local other = joinPath(dir, hash .. "." .. (ext == "jpg" and "png" or "jpg"))
+                    local other = joinPath(dir, ckey .. "." .. (ext == "jpg" and "png" or "jpg"))
                     pcall(os.remove, other)
                     pcall(os.remove, target)
                     local okr, renamed = pcall(os.rename, tmp, target)

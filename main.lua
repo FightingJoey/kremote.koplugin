@@ -255,11 +255,38 @@ local ACTIONS = {
     -- 重启/退出都必须等 HTTP 响应发出去再动手：handler 返回后 httpcore 才 send，
     -- 在这里同步执行会让手机收到连接重置，看不到任何结果
     --
-    -- 休眠同理：UIManager:suspend() 触发 powerd 挂起，Wi-Fi 随即断开，
-    -- 手机端连响应都收不到。延后一点，让它先把 ok 发回去。
+    -- 休眠：不能直接 UIManager:suspend() 了事。
+    --
+    -- UIManager:suspend() 本身等价于按一次电源键（powerd powerButton=1），
+    -- 链路是对的：powerd 发 goingToScreenSaver → Kindle:intoScreenSaver() →
+    -- Screensaver:setup()+show() → powerd:beforeSuspend()。问题出在 show()：
+    -- 它内部只是 UIManager:show(widget, "full")，把 widget 压栈并标脏，真正
+    -- paintTo + 写 fb 要等下一次 repaint。紧接着的 beforeSuspend 请求挂起，
+    -- 设备就在"fb 里还是书页"的状态下睡过去了 —— 屏幕停在正文，壁纸根本没上屏。
+    -- 按电源键时同样的代码能显示壁纸，是因为 powerd 自己的节奏给了刷新时间。
+    --
+    -- 修法：给 Screensaver.show 补一次强制同步刷新，让它返回时画面已经落地。
+    -- 不动休眠链路本身（多调一次 intoScreenSaver 会让 powerButton 变成"按两下"，
+    -- 设备被唤醒回 active，而 KOReader 仍以为自己在休眠）。
     suspend = function()
         UIManager:scheduleIn(0.6, function()
-            local ok, err = pcall(function() UIManager:suspend() end)
+            local ok, err = pcall(function()
+                local ss = require("ui/screensaver")
+                if not ss._kremote_show_patched then
+                    local orig_show = ss.show
+                    ss.show = function(ss_self, ...)
+                        local r = orig_show(ss_self, ...)
+                        -- 只有真画了东西才需要等；落空时（disable/无图）直接放行
+                        pcall(function()
+                            UIManager:forceRePaint()
+                            UIManager:waitForVSync()
+                        end)
+                        return r
+                    end
+                    ss._kremote_show_patched = true
+                end
+                UIManager:suspend()
+            end)
             if not ok then logger.warn("kremote: suspend failed", tostring(err)) end
         end)
     end,

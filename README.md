@@ -1,10 +1,12 @@
 # kremote.koplugin
 
-用手机浏览器遥控 [KOReader](https://github.com/koreader/koreader) 的插件：在 Kindle 上起一个极简 HTTP 服务，手机连同一个 Wi-Fi，打开网页就能翻页、切章节、调字号、调前光、切夜间模式，并实时看到书名、页码、百分比和电量。
+用手机浏览器遥控 [KOReader](https://github.com/koreader/koreader) 的插件：在 Kindle 上起一个极简 HTTP 服务，手机连同一个 Wi-Fi，打开网页先看到书库，点一本书 Kindle 就跳到那本书；进去以后翻页、切章节、调字号、调前光、切夜间模式，并实时看到书名、页码、百分比和电量。
 
 不碰蓝牙、不碰内核、不需要 root，只用一个 Lua 写的非阻塞 HTTP 服务。
 
-![遥控面板](docs/panel.png)
+| 书架页 | 控制页 |
+|---|---|
+| ![书架](docs/shelf.png) | ![遥控面板](docs/panel.png) |
 
 ## 为什么不是蓝牙
 
@@ -18,6 +20,9 @@ Kindle 的蓝牙栈只注册了 A2DP/HFP 音频 profile，没有 SPP 串口服�
 
 | 分组 | 能力 |
 |---|---|
+| 书架 | 最近阅读 3 本做成轮播，全部书两行横向滑动，只显示封面、书名、进度 |
+| 选书 | 点封面 → Kindle 打开这本书，手机进控制页；点左上角返回 → 两边一起回书架 |
+| 跟随 | 手机按 Kindle 的实际状态决定显示哪一页；你在 Kindle 上手动开书/关书，网页会跟着切 |
 | 翻页 | 上一页 / 下一页（EPUB 和 PDF 都有效） |
 | 章节 | 上一章 / 下一章 |
 | 排版 | 字号 + / − |
@@ -32,6 +37,7 @@ Kindle 的蓝牙栈只注册了 A2DP/HFP 音频 profile，没有 SPP 串口服�
 - **音量、朗读**：设备没有扬声器（能读到音频设备不代表能发声）
 - **实时屏幕镜像**：e-ink 每次全刷 1 秒以上，当第二块显示器不现实
 - **依赖屏幕坐标的操作**：选中文字、手写批注、点具体某个菜单按钮。这类操作本质是"在某个像素位置点一下"，坐标随排版和字体会变，没法可靠映射
+- **没有内置封面的书**：占位方块显示书名首字。封面来自 KOReader 的 CoverBrowser 缓存，它没抽过的书，第一次请求会现场抽（几秒），之后落盘缓存
 
 ## 兼容性
 
@@ -87,7 +93,12 @@ iptables -I INPUT 1 -i wlan0 -p tcp --dport 18080 -m conntrack --ctstate NEW -j 
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/` | 手机控制面板（HTML） |
+| GET | `/` | 手机端页面（HTML，书架页或控制页由 `/api/state` 决定） |
+| GET | `/api/state` | 轻量状态：当前在书架还是阅读、电量（书架页轮询用） |
+| GET | `/api/shelf` | 书库 JSON：`recent` 最近 3 本 + `books` 全部，`?r=1` 强制重扫 |
+| GET | `/api/cover?h=<hash>` | 书籍封面 JPEG/PNG，按文件 mtime 落盘缓存，带一天浏览器缓存头 |
+| GET | `/api/open?h=<hash>` | 在 Kindle 上打开这本书（返回后延时 0.35s 才真开，避免手机端等到超时） |
+| GET | `/api/home` | 关掉当前文档退回书架 |
 | GET | `/api/status` | 当前状态 JSON |
 | GET | `/api/next` | 下一页 |
 | GET | `/api/prev` | 上一页 |
@@ -101,20 +112,32 @@ iptables -I INPUT 1 -i wlan0 -p tcp --dport 18080 -m conntrack --ctstate NEW -j 
 | GET | `/api/restart` | 重启 KOReader |
 | GET | `/api/quit` | 退出 KOReader |
 
+`/api/shelf` 返回示例（`h` 是路径哈希，`t` 书名，`a` 作者，`p` 百分比，`c` 是否有封面）：
+
+```json
+{"ok":1,"view":"shelf","battery":76,"charging":0,
+ "recent":[{"h":"aaa00001","t":"三体","a":"刘慈欣","p":42.3,"c":1}],
+ "books":[{"h":"bbb00000","t":"三体","a":"刘慈欣","p":0,"c":1}]}
+```
+
 `/api/status` 返回示例：
 
 ```json
-{"ok":1,"title":"书名","authors":"作者","page":2358,"pages":6935,
+{"ok":1,"view":"reader","title":"书名","authors":"作者","page":2358,"pages":6935,
  "percent":34.0,"battery":49,"charging":0,"night":0,"light":12,"lightmax":24}
 ```
 
-**状态码**：`200` 成功；`404` 未知路径；`409` 该动作需要先打开一本书（书架上点翻页会走到这里）；`500` 动作执行出错，响应体带 `error` 字段。
+**状态码**：`200` 成功；`404` 未知路径，或 `h` 解析不到书；`409` 该动作需要先打开一本书（书架上点翻页会走到这里）；`500` 动作执行出错，响应体带 `error` 字段。
 
 退出码：动作用 `200` 表示"已派发"，不代表 UI 已经完成渲染。
 
 ## 实现要点
 
-- **非阻塞 HTTP**：`httpcore.lua` 自己实现的最小 HTTP/1.1 解析器，`accept`/`recv` 全部非阻塞，由 `UIManager:scheduleIn(0.15, ...)` 驱动，不占 UI 线程。参考了 KOReader 自带的 `simpletcpserver.lua` 的做法。
+- **非阻塞 HTTP**：`httpcore.lua` 自己实现的最小 HTTP/1.1 解析器，`accept`/`recv` 全部非阻塞，由 `UIManager:scheduleIn(0.15, ...)` 驱动，不占 UI 线程。参考了 KOReader 自带的 `simpletcpserver.lua` 的做法。发大响应（封面图）时按已发送长度循环推进，避免 `send` 只发出一部分就关连接。
+- **书库数据从哪来**：最近阅读直接读 `$DataDir/history.lua`，不依赖 `ReadHistory` 单例是否已经加载；进度先问 `BookList.getBookInfo`（和文件管理器列表缓存同源），再退到 `DocSettings`；书名作者走 CoverBrowser 的 `bookinfo_cache.sqlite3`。整表扫描结果缓存 60 秒。
+- **封面为什么不自己抽**：每本书现场 `openDocument` 抽封面要几百毫秒到几秒，几十本一起抽能把 Kindle 卡死。CoverBrowser 早就把封面缩略图 zstd 压缩存进它自己的 SQLite 了，这里只做"解压 → 缩到 260px 宽 → JPEG 编码"，落盘到 `settings/kremote_covers/<hash>.jpg`，按书文件 mtime 判失效。列表里只读元数据，不解封面 BLOB。
+- **两个页面怎么切**：`/api/status` 的 `view` 由"当前有没有打开的文档"算出来，网页按 Kindle 的真实状态决定显示哪一页；控制页每 2 秒、书架页每 4 秒轮询一次，所以你在 Kindle 上手动开书关书，手机那边会自己跟上。
+- **打开书籍延时执行**：`openDocument` 会阻塞一两秒（解析文件、建立排版）。所以 `/api/open` 只做存在性检查，然后 `UIManager:scheduleIn(0.35, ...)` 派发，等 HTTP 响应发完再切书，否则手机端看到的是连接被重置。
 - **翻页**走 `GotoViewRel` 事件，和官方自动翻页插件 `autoturn` 用的是同一行调用，`ReaderRolling` 和 `ReaderPaging` 都实现了它，所以 EPUB 和 PDF 通用。
 - **亮度**走 `Device:getPowerDevice():setIntensity(n)`，不直接写 `/sys/class/backlight`。直接写 sysfs 会让 KOReader 记录的档位和硬件实际值脱节，下次它恢复亮度时会把你的设置覆盖掉。
 - **常驻插件**：没有设 `is_doc_only = true`，所以书架和阅读界面各会加载一份实例。两份实例通过模块级的 `SERVER` 表共享同一个服务，避免重复 `bind` 端口。动作按"当前是否有打开的文档"派发。
@@ -136,9 +159,24 @@ iptables -I INPUT 1 -i wlan0 -p tcp --dport 18080 -m conntrack --ctstate NEW -j 
 /mnt/us/koreader/luajit tests/test_ip.lua
 ```
 
-`tests/panel_preview.html` 是面板的本地预览版，内置假数据，改 UI 时可以直接在电脑浏览器里看效果，不用反复传设备。
-
 裸跑 `luajit` 没有 KOReader 的 `package.path`，所以脚本开头要 `require("setupkoenv")`。
+
+电脑侧还有两个不用设备的工具：
+
+```bash
+# 本地预览：直接读 panel.html，假书库 + 假封面，改完刷新浏览器
+python3 tests/preview_server.py          # http://127.0.0.1:8099
+                                         # /?view=reader 看控制页
+
+# HTTP 层：用假 socket 顶替 LuaSocket，重点验证大响应分片发送、HEAD、404/500
+python3 tests/test_httpcore_mock.py
+
+# 书库逻辑：用 lupa 起一个 Lua 运行时，mock 掉 KOReader 模块，
+# 验证目录扫描、进度读取、封面缩放/编码/磁盘缓存
+python3 tests/mock_shelf.py
+```
+
+三个脚本都只依赖 `pip3 install lupa pillow`，不需要 Kindle，也不需要 Lua。
 
 ## 已知限制
 

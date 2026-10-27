@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#15171a">
+<title>Kindle 遥控</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:#15171a;color:#e8e6e1;
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;
+  -webkit-user-select:none;user-select:none;overscroll-behavior:none}
+body{height:100vh;height:100dvh;overflow:hidden}
+
+/* 两个页面各自固定一屏高，切换靠 .on */
+.page{position:fixed;inset:0;display:none;flex-direction:column;
+  padding:14px 14px calc(10px + env(safe-area-inset-bottom))}
+.page.on{display:flex}
+
+button{background:#22252b;color:#e8e6e1;border:1px solid #33373e;border-radius:14px;
+  font-family:inherit;font-size:15px;padding:14px 8px;cursor:pointer;width:100%;
+  transition:background .12s ease,transform .06s ease}
+button:active{background:#2f343b;transform:scale(.975)}
+
+/* ─────────── 书架页 ─────────── */
+.shd{flex:0 0 auto;display:flex;justify-content:space-between;align-items:center;
+  font-size:12px;color:#8b8e94;letter-spacing:.02em;margin-bottom:10px}
+.brand{font-size:19px;font-weight:600;color:#e8e6e1;letter-spacing:.01em}
+
+.carousel{flex:0 0 auto;margin-bottom:16px;position:relative}
+.track{display:flex;overflow-x:auto;scroll-snap-type:x mandatory;
+  scrollbar-width:none;-webkit-overflow-scrolling:touch;gap:0}
+.track::-webkit-scrollbar{display:none}
+.slide{flex:0 0 100%;scroll-snap-align:center;display:flex;gap:14px;
+  align-items:center;padding:2px}
+.slide .cv{width:96px;height:142px;flex:0 0 auto;border-radius:8px;overflow:hidden;
+  background:#22252b;position:relative;box-shadow:0 6px 18px rgba(0,0,0,.45)}
+/* 封面必须压在占位字上面：.ph 是 absolute，会盖住普通流的 img */
+.slide .cv img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;
+  display:block;z-index:1}
+.slide .info{flex:1 1 auto;min-width:0}
+.slide .nm{font-size:16px;font-weight:500;line-height:1.35;margin-bottom:6px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.slide .au{font-size:12px;color:#8b8e94;margin-bottom:12px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:1.2em}
+.slide .pg{font-size:12px;color:#6fa8c8;margin-bottom:6px;
+  font-variant-numeric:tabular-nums}
+.slide .pb{height:4px;background:#262a30;border-radius:2px;overflow:hidden}
+.slide .pb>i{display:block;height:100%;background:#6fa8c8;border-radius:2px}
+
+.dots{display:flex;justify-content:center;gap:6px;margin-top:10px;height:6px}
+.dots i{width:6px;height:6px;border-radius:50%;background:#3a3f47;transition:background .2s}
+.dots i.on{background:#6fa8c8}
+
+.allwrap{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+.secttl{flex:0 0 auto;font-size:12px;color:#8b8e94;margin-bottom:8px}
+.secttl span{color:#5c6068}
+/* 两行横向滚动。行高按内容（封面 2:3 + 书名 + 进度）算，剩余高度靠
+   align-content:center 均分到上下；不要用 1fr，否则封面会被拉成 1:2 的长条。
+   封面宽度跟着视口高度走：矮屏（667 高）自动缩小，保证两行放得下。 */
+.all{flex:1 1 auto;min-height:0;display:grid;grid-auto-flow:column;
+  --cw:clamp(56px, calc((100vh - 425px) / 3), 112px);
+  --cw:clamp(56px, calc((100dvh - 425px) / 3), 112px);
+  grid-template-rows:repeat(2,auto);grid-auto-columns:var(--cw);gap:16px 12px;
+  align-content:center;align-content:safe center;
+  overflow-x:auto;overflow-y:hidden;scrollbar-width:none;
+  -webkit-overflow-scrolling:touch;padding-bottom:2px}
+.all::-webkit-scrollbar{display:none}
+
+.bk{display:flex;flex-direction:column;min-width:0;cursor:pointer}
+.bk .cv{width:var(--cw);flex:0 0 auto;aspect-ratio:2/3;border-radius:7px;overflow:hidden;
+  background:#22252b;position:relative}
+.bk .cv img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;
+  display:block;z-index:1}
+.bk .nm{flex:0 0 auto;font-size:11px;line-height:1.3;margin-top:5px;color:#d7d5d0;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+  min-height:2.6em}
+.bk .pg{flex:0 0 auto;font-size:10px;color:#6fa8c8;margin-top:2px;
+  font-variant-numeric:tabular-nums}
+
+/* 无封面时的占位：底色 + 书名首字。
+   用 .cv.ph::before 而不是额外插一个 div —— 图片 onload 时摘掉 .ph 即可，
+   不用操心谁盖住谁（absolute 的 div 会盖在普通流的 img 上面）。 */
+.cv.ph{background:linear-gradient(160deg,#262a30,#1c1f24)}
+.cv.ph::before{content:attr(data-ini);position:absolute;inset:0;z-index:2;
+  display:flex;align-items:center;justify-content:center;
+  font-size:26px;color:#4a5058}
+.cv.ph.bk-ini::before{font-size:20px}
+
+.empty{flex:1 1 auto;display:flex;align-items:center;justify-content:center;
+  color:#6c7076;font-size:13px;text-align:center;line-height:1.7;padding:0 20px}
+
+/* ─────────── 控制页 ─────────── */
+.hd{flex:0 0 auto;display:flex;justify-content:space-between;align-items:center;
+  font-size:12px;color:#8b8e94;letter-spacing:.02em;margin-bottom:6px}
+.hd-l{display:flex;align-items:center;gap:8px;min-width:0}
+.hd-r{display:flex;align-items:center;gap:9px}
+.back{width:34px;height:34px;padding:0;border-radius:10px;font-size:22px;line-height:1;
+  background:transparent;border:1px solid #2b3038;color:#8b8e94;flex:0 0 auto;
+  display:flex;align-items:center;justify-content:center}
+.gear{width:34px;height:34px;padding:0;border-radius:10px;font-size:17px;line-height:1;
+  background:transparent;border:1px solid #2b3038;color:#8b8e94;flex:0 0 auto}
+.gear.open{background:#2f343b;color:#e8e6e1;border-color:#4a5058}
+h1{flex:0 0 auto;font-size:16px;font-weight:500;margin:0 0 3px;line-height:1.35;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub{flex:0 0 auto;font-size:12px;color:#8b8e94;line-height:1.5}
+.bar{flex:0 0 auto;height:4px;background:#262a30;border-radius:2px;margin:12px 0;overflow:hidden}
+.bar>i{display:block;height:100%;width:0;background:#6fa8c8;border-radius:2px;transition:width .25s ease}
+
+/* 亮度：左右各一个步进键，中间滑杆 */
+.lrow{flex:0 0 auto;display:flex;align-items:center;gap:9px;margin:0 0 10px;min-width:0}
+.lbtn{width:54px;height:54px;flex:0 0 auto;padding:0;border-radius:14px;
+  font-size:21px;line-height:1;color:#c9cdd3}
+/* min-width:0 是必须的：flex item 默认 min-width:auto，range 的固有宽度
+   会把整行撑得比视口还宽，右侧的「＋」和翻页键就被挤出屏幕 */
+.sl{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:10px;height:54px;
+  background:#22252b;border:1px solid #33373e;border-radius:14px;padding:0 15px}
+.lv{font-size:13px;color:#6fa8c8;width:2em;text-align:right;flex:0 0 auto;
+  font-variant-numeric:tabular-nums}
+input[type=range]{-webkit-appearance:none;appearance:none;flex:1 1 auto;min-width:0;
+  width:auto;height:4px;margin:0;background:#3a3f47;border-radius:2px;outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;
+  border-radius:50%;background:#e8e6e1;border:1px solid #15171a;cursor:pointer}
+input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
+  background:#e8e6e1;border:1px solid #15171a;cursor:pointer}
+
+/* 左右翻页：吃掉中间剩余的全部高度 */
+.turn{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:1fr 1fr;
+  grid-template-rows:1fr;gap:10px;margin-bottom:10px}
+.turn button{display:flex;align-items:center;justify-content:center;
+  font-size:clamp(28px,5.5vh,42px)}
+/* 上下章：紧贴底部提示文字，两者间距 10px */
+.chap{flex:0 0 auto;display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.chap button{height:54px;font-size:15px}
+
+/* 齿轮下拉 */
+.menu{position:absolute;right:14px;top:54px;min-width:160px;background:#22252b;
+  border:1px solid #3a3f47;border-radius:12px;padding:6px;display:none;z-index:50;
+  box-shadow:0 10px 28px rgba(0,0,0,.55)}
+.menu.show{display:block}
+.menu button{display:block;width:100%;text-align:left;font-size:14px;
+  padding:13px 15px;border:none;background:transparent;border-radius:8px}
+.menu button:active{background:#2f343b;transform:none}
+.menu hr{border:none;border-top:1px solid #33373e;margin:5px 8px}
+
+.tip{flex:0 0 auto;font-size:12px;color:#6c7076;line-height:1.6;margin:10px 0 0}
+
+/* 一次性提示 */
+.toast{position:fixed;left:50%;bottom:72px;transform:translateX(-50%) translateY(8px);
+  background:#2f343b;border:1px solid #4a5058;color:#e8e6e1;font-size:13px;
+  padding:10px 16px;border-radius:10px;opacity:0;pointer-events:none;z-index:80;
+  max-width:78vw;text-align:center;transition:opacity .18s ease,transform .18s ease}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* 打开书籍时的遮罩 */
+.opening{position:fixed;inset:0;background:rgba(21,23,26,.92);z-index:90;
+  display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+  padding:0 34px;text-align:center}
+.opening.on{display:flex}
+.opening .t{font-size:15px;color:#e8e6e1;line-height:1.5}
+.opening .s{font-size:12px;color:#8b8e94}
+.spin{width:26px;height:26px;border-radius:50%;border:2px solid #3a3f47;
+  border-top-color:#6fa8c8;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+
+<!-- ══════════ 书架页 ══════════ -->
+<div class="page" id="shelf">
+  <div class="shd">
+    <span class="brand">书架</span>
+    <span id="sbatt">电量 —</span>
+  </div>
+
+  <div class="carousel" id="carousel">
+    <div class="track" id="track"></div>
+    <div class="dots" id="dots"></div>
+  </div>
+
+  <div class="allwrap">
+    <div class="secttl">全部书籍 <span id="cnt"></span></div>
+    <div class="all" id="all"></div>
+  </div>
+
+  <p class="tip">手机与 Kindle 需在同一个 Wi-Fi 下</p>
+</div>
+
+<!-- ══════════ 控制页 ══════════ -->
+<div class="page" id="reader">
+  <div class="hd">
+    <span class="hd-l">
+      <button class="back" id="back" aria-label="返回书架">‹</button>
+      <span id="batt">电量 —</span>
+    </span>
+    <span class="hd-r">
+      <span id="pct">—</span>
+      <button class="gear" id="gear" aria-label="更多">⚙</button>
+    </span>
+  </div>
+  <h1 id="title">正在连接…</h1>
+  <div class="sub" id="author"></div>
+  <div class="bar"><i id="prog"></i></div>
+
+  <div class="menu" id="menu">
+    <button data-act="night">夜间模式</button>
+    <button data-act="refresh">强制全刷</button>
+    <button data-act="font_dec">字号 －</button>
+    <button data-act="font_inc">字号 ＋</button>
+    <hr>
+    <button data-act="restart">重启</button>
+    <button data-act="quit">退出</button>
+  </div>
+
+  <div class="lrow" id="lrow">
+    <button class="lbtn" id="ldn" aria-label="减一档">－</button>
+    <div class="sl">
+      <input type="range" id="light" min="0" max="24" step="1" value="0">
+      <span class="lv" id="lv">–</span>
+    </div>
+    <button class="lbtn" id="lup" aria-label="加一档">＋</button>
+  </div>
+
+  <div class="turn">
+    <button id="prev" aria-label="上一页">◀</button>
+    <button id="next" aria-label="下一页">▶</button>
+  </div>
+
+  <div class="chap">
+    <button id="cp" data-act="chapter_prev">上一章</button>
+    <button id="cn" data-act="chapter_next">下一章</button>
+  </div>
+
+  <p class="tip">手机与 Kindle 需在同一个 Wi-Fi 下</p>
+</div>
+
+<div class="opening" id="opening">
+  <div class="spin"></div>
+  <div class="t" id="opening-t">正在打开…</div>
+  <div class="s">Kindle 那边会跳到这本书</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+
+  var S = {
+    view: 'shelf',        // 当前网页显示哪一页
+    kindleView: null,     // Kindle 那边的状态（reader / shelf）
+    shelfLoaded: false,
+    loading: false,
+    recent: [],
+    books: [],
+    slide: 0,
+    slideTimer: null,
+    pollTimer: null,
+    busy: false,
+    lightBusy: false,
+    lightTimer: null,
+    toastTimer: null
+  };
+
+  /* ───────── 小工具 ───────── */
+
+  function api(url){
+    return fetch(url, {cache:'no-store'}).then(function(r){ return r.json(); });
+  }
+
+  function toast(msg){
+    var t = $('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(S.toastTimer);
+    S.toastTimer = setTimeout(function(){ t.classList.remove('show'); }, 1900);
+  }
+
+  function offline(){
+    if (S.view === 'reader'){
+      $('title').textContent = '连接已断开';
+      $('author').textContent = '检查 Wi-Fi，或让 Kindle 亮屏后再试';
+    }
+  }
+
+  function pctText(p){
+    if (typeof p !== 'number' || p <= 0) return '未读';
+    if (p >= 99.9) return '已读完';
+    return p.toFixed(1).replace(/\.0$/, '') + '%';
+  }
+
+  /* ───────── 页面切换 ───────── */
+
+  function switchTo(view){
+    if (S.view === view) return;
+    S.view = view;
+    $('shelf').classList.toggle('on', view === 'shelf');
+    $('reader').classList.toggle('on', view === 'reader');
+
+    if (view === 'shelf'){
+      stopCarousel();
+      clearInterval(S.pollTimer);
+      S.pollTimer = setInterval(pollShelfState, 4000);
+      if (!S.shelfLoaded) loadShelf();
+      else startCarousel();
+    } else {
+      clearInterval(S.pollTimer);
+      S.pollTimer = setInterval(tick, 2000);
+      tick();
+    }
+  }
+
+  /* ───────── 书架渲染 ───────── */
+
+  function coverBox(b, big){
+    var cv = document.createElement('div');
+    cv.className = 'cv ph' + (big ? '' : ' bk-ini');
+
+    var first = (b.t || '?').replace(/^[\s《「【]+/, '').charAt(0) || '?';
+    cv.setAttribute('data-ini', first);
+
+    if (b.c){
+      var img = document.createElement('img');
+      img.alt = '';
+      // 轮播那 3 张始终可见，直接加载；书架里的书可能上百本，
+      // 交给浏览器按可见性懒加载，省 Kindle 那边的解码开销
+      img.loading = big ? 'eager' : 'lazy';
+      img.src = '/api/cover?h=' + encodeURIComponent(b.h);
+      // 加载成功才摘掉占位字；失败就一直留着首字，不会出现空白块
+      img.onload = function(){ cv.classList.remove('ph'); };
+      img.onerror = function(){ img.remove(); };
+      cv.appendChild(img);
+    }
+    return cv;
+  }
+
+  function buildSlide(b){
+    var s = document.createElement('div');
+    s.className = 'slide';
+    s.ondblclick = null;
+    s.onclick = function(){ openBook(b); };
+
+    s.appendChild(coverBox(b, true));
+
+    var info = document.createElement('div');
+    info.className = 'info';
+
+    var nm = document.createElement('div');
+    nm.className = 'nm';
+    nm.textContent = b.t || '(无标题)';
+    info.appendChild(nm);
+
+    var au = document.createElement('div');
+    au.className = 'au';
+    au.textContent = b.a || '';
+    info.appendChild(au);
+
+    var pg = document.createElement('div');
+    pg.className = 'pg';
+    pg.textContent = pctText(b.p);
+    info.appendChild(pg);
+
+    var pb = document.createElement('div');
+    pb.className = 'pb';
+    var fill = document.createElement('i');
+    fill.style.width = Math.max(0, Math.min(100, b.p || 0)) + '%';
+    pb.appendChild(fill);
+    info.appendChild(pb);
+
+    s.appendChild(info);
+    return s;
+  }
+
+  function buildBook(b){
+    var d = document.createElement('div');
+    d.className = 'bk';
+    d.onclick = function(){ openBook(b); };
+
+    d.appendChild(coverBox(b, false));
+
+    var nm = document.createElement('div');
+    nm.className = 'nm';
+    nm.textContent = b.t || '(无标题)';
+    d.appendChild(nm);
+
+    var pg = document.createElement('div');
+    pg.className = 'pg';
+    pg.textContent = pctText(b.p);
+    d.appendChild(pg);
+
+    return d;
+  }
+
+  function renderShelf(d){
+    S.recent = d.recent || [];
+    S.books = d.books || [];
+
+    // 最近阅读轮播
+    var track = $('track'), dots = $('dots');
+    track.innerHTML = '';
+    dots.innerHTML = '';
+    if (S.recent.length === 0){
+      var e = document.createElement('div');
+      e.className = 'empty';
+      e.textContent = '还没有阅读记录';
+      track.appendChild(e);
+    } else {
+      S.recent.forEach(function(b){ track.appendChild(buildSlide(b)); });
+      if (S.recent.length > 1){
+        S.recent.forEach(function(_, i){
+          var dot = document.createElement('i');
+          if (i === 0) dot.className = 'on';
+          dot.onclick = function(){ goSlide(i); };
+          dots.appendChild(dot);
+        });
+      }
+    }
+
+    // 全部书籍
+    var all = $('all');
+    all.innerHTML = '';
+    if (S.books.length === 0){
+      var e2 = document.createElement('div');
+      e2.className = 'empty';
+      e2.textContent = '没有找到书。请确认 Kindle 的「书库目录」里有书。';
+      all.appendChild(e2);
+    } else {
+      S.books.forEach(function(b){ all.appendChild(buildBook(b)); });
+    }
+    $('cnt').textContent = S.books.length ? '· ' + S.books.length + ' 本' : '';
+
+    $('sbatt').textContent = '电量 ' + (d.battery < 0 || d.battery == null ? '—' : d.battery + '%')
+      + (d.charging ? ' ↯' : '');
+
+    S.shelfLoaded = true;
+    S.slide = 0;
+    syncDots();
+    startCarousel();
+  }
+
+  function loadShelf(force){
+    if (S.loading) return;
+    S.loading = true;
+    api('/api/shelf' + (force ? '?r=1' : ''))
+      .then(function(d){
+        S.loading = false;
+        if (!d || !d.ok){ toast((d && d.error) || '书架加载失败'); return; }
+        renderShelf(d);
+      })
+      .catch(function(){ S.loading = false; S.shelfLoaded = false; });
+  }
+
+  /* ───────── 轮播 ───────── */
+
+  function slideWidth(){
+    var t = $('track');
+    return t ? t.clientWidth : 0;
+  }
+
+  function goSlide(i){
+    var n = S.recent.length;
+    if (n === 0) return;
+    S.slide = ((i % n) + n) % n;
+    var w = slideWidth();
+    $('track').scrollTo({left: S.slide * w, behavior: 'smooth'});
+    syncDots();
+  }
+
+  function syncDots(){
+    var dots = $('dots').children;
+    for (var i = 0; i < dots.length; i++){
+      dots[i].className = (i === S.slide) ? 'on' : '';
+    }
+  }
+
+  function startCarousel(){
+    stopCarousel();
+    if (S.recent.length < 2) return;
+    S.slideTimer = setInterval(function(){
+      if (S.view !== 'shelf') return;
+      goSlide(S.slide + 1);
+    }, 4500);
+  }
+
+  function stopCarousel(){
+    clearInterval(S.slideTimer);
+    S.slideTimer = null;
+  }
+
+  // 用户手动滑动后：更新指示点，并把自动轮播的计时重置
+  var scrollTimer = null;
+  $('track').addEventListener('scroll', function(){
+    clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(function(){
+      var w = slideWidth();
+      if (!w) return;
+      var i = Math.round($('track').scrollLeft / w);
+      if (i !== S.slide){ S.slide = i; syncDots(); }
+      startCarousel();
+    }, 120);
+  }, {passive: true});
+
+  /* ───────── 打开书籍 / 返回书架 ───────── */
+
+  function openBook(b){
+    if (S.busy) return;
+    S.busy = true;
+
+    $('opening-t').textContent = '正在打开《' + (b.t || '') + '》';
+    $('opening').classList.add('on');
+
+    api('/api/open?h=' + encodeURIComponent(b.h))
+      .then(function(d){
+        if (!d || !d.ok){
+          $('opening').classList.remove('on');
+          S.busy = false;
+          toast((d && d.error) || '打开失败');
+          return;
+        }
+        // Kindle 打开文档要一两秒，这里切到控制页并等状态变成 reader
+        switchTo('reader');
+        $('title').textContent = b.t || '';
+        $('author').textContent = b.a || '';
+        $('pct').textContent = '正在打开…';
+        waitForReader(0);
+      })
+      .catch(function(){
+        $('opening').classList.remove('on');
+        S.busy = false;
+        offline();
+      });
+  }
+
+  function waitForReader(n){
+    if (n > 20){   // 最多等约 8 秒
+      $('opening').classList.remove('on');
+      S.busy = false;
+      toast('打开超时，请看看 Kindle 屏幕');
+      return;
+    }
+    setTimeout(function(){
+      api('/api/status').then(function(s){
+        if (s && s.view === 'reader'){
+          $('opening').classList.remove('on');
+          S.busy = false;
+          S.kindleView = 'reader';
+          paint(s);
+        } else {
+          waitForReader(n + 1);
+        }
+      }).catch(function(){
+        $('opening').classList.remove('on');
+        S.busy = false;
+        offline();
+      });
+    }, 400);
+  }
+
+  function goHome(){
+    if (S.busy) return;
+    S.busy = true;
+    api('/api/home').then(function(d){
+      S.busy = false;
+      if (d && d.ok === 0){ toast(d.error || '返回书架失败'); return; }
+      S.kindleView = 'shelf';
+      S.shelfLoaded = false;      // 进度可能变了，回书架时重新拉一次
+      switchTo('shelf');
+      loadShelf(true);
+    }).catch(function(){ S.busy = false; offline(); });
+  }
+
+  /* ───────── 控制页 ───────── */
+
+  function paint(s){
+    if (!s) return;
+    $('title').textContent = s.title || '(未打开书籍)';
+    $('author').textContent = s.authors || '';
+    $('pct').textContent = s.pages > 0 ? (s.percent + '%  ·  ' + s.page + '/' + s.pages) : '—';
+    $('prog').style.width = Math.min(100, s.percent || 0) + '%';
+    $('batt').textContent = '电量 ' + (s.battery < 0 ? '—' : s.battery + '%') + (s.charging ? ' ↯' : '');
+    if (s.lightmax > 0){
+      $('lrow').style.display = '';
+      $('light').max = s.lightmax;
+      if (!S.lightBusy){ $('light').value = s.light; $('lv').textContent = s.light; }
+    } else {
+      $('lrow').style.display = 'none';
+    }
+  }
+
+  function act(a){
+    if (S.busy) return;
+    S.busy = true;
+    if (a === 'quit' || a === 'restart'){
+      $('title').textContent = (a === 'quit' ? '正在退出…' : '正在重启…');
+      $('author').textContent = 'Kindle 会断开连接，稍等几秒';
+    }
+    fetch('/api/' + a, {cache:'no-store'}).then(function(r){ return r.json(); })
+      .then(function(s){
+        S.busy = false;
+        if (s && s.ok === 0){ toast(s.error || '操作失败'); return; }
+        paint(s);
+      })
+      .catch(function(){ S.busy = false; offline(); });
+  }
+
+  function tick(){
+    if (S.view !== 'reader') return;
+    api('/api/status').then(function(s){
+      if (!s) return;
+      S.kindleView = s.view;
+      // Kindle 那边关书退回书架了：网页也跟着回书架
+      if (s.view === 'shelf' && !S.busy){
+        S.shelfLoaded = false;
+        switchTo('shelf');
+        loadShelf(true);
+        return;
+      }
+      paint(s);
+    }).catch(offline);
+  }
+
+  function pollShelfState(){
+    if (S.view !== 'shelf') return;
+    api('/api/state').then(function(s){
+      if (!s) return;
+      S.kindleView = s.view;
+      $('sbatt').textContent = '电量 ' + (s.battery < 0 ? '—' : s.battery + '%') + (s.charging ? ' ↯' : '');
+      // 手动在 Kindle 上打开了书：网页自动进控制页
+      if (s.view === 'reader' && !S.busy) switchTo('reader');
+    }).catch(function(){});
+  }
+
+  /* ───────── 控制页交互 ───────── */
+
+  ['prev','next','cp','cn'].forEach(function(k){
+    var el = $(k);
+    if (el) el.onclick = function(){ act(el.getAttribute('data-act') || k); };
+  });
+
+  $('back').onclick = function(){ goHome(); };
+
+  var menu = $('menu'), gear = $('gear');
+  function closeMenu(){ menu.classList.remove('show'); gear.classList.remove('open'); }
+  gear.onclick = function(e){
+    e.stopPropagation();
+    var on = menu.classList.toggle('show');
+    gear.classList.toggle('open', on);
+  };
+  menu.addEventListener('click', function(e){ e.stopPropagation(); });
+  document.addEventListener('click', closeMenu);
+  Array.prototype.forEach.call(menu.querySelectorAll('button'), function(b){
+    b.onclick = function(e){
+      e.stopPropagation();
+      closeMenu();
+      act(b.getAttribute('data-act'));
+    };
+  });
+
+  // 亮度：滑杆拖动 180ms 防抖（逐格发会把 e-ink 的事件循环堵住），左右键每次 ±1
+  function pushLight(v){
+    S.lightBusy = true;
+    $('lv').textContent = v;
+    fetch('/api/light?n=' + v, {cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(s){ S.lightBusy = false; paint(s); })
+      .catch(function(){ S.lightBusy = false; offline(); });
+  }
+  $('light').oninput = function(){
+    S.lightBusy = true;
+    $('lv').textContent = $('light').value;
+    clearTimeout(S.lightTimer);
+    S.lightTimer = setTimeout(function(){ pushLight($('light').value); }, 180);
+  };
+  function stepLight(d){
+    var max = parseInt($('light').max, 10) || 24;
+    var v = parseInt($('light').value, 10) || 0;
+    v = Math.max(0, Math.min(max, v + d));
+    $('light').value = v;
+    clearTimeout(S.lightTimer);
+    pushLight(v);
+  }
+  $('ldn').onclick = function(){ stepLight(-1); };
+  $('lup').onclick = function(){ stepLight(1); };
+
+  /* ───────── 启动：按 Kindle 当前状态决定显示哪一页 ───────── */
+
+  api('/api/state').then(function(s){
+    if (s && s.view === 'reader'){
+      S.kindleView = 'reader';
+      $('reader').classList.add('on');
+      S.view = 'reader';
+      clearInterval(S.pollTimer);
+      S.pollTimer = setInterval(tick, 2000);
+      tick();
+    } else {
+      $('shelf').classList.add('on');
+      S.view = 'shelf';
+      S.shelfLoaded = false;
+      loadShelf(false);
+      clearInterval(S.pollTimer);
+      S.pollTimer = setInterval(pollShelfState, 4000);
+    }
+  }).catch(function(){
+    // 连不上就先显示书架页，让用户看到"断开"而不是空白
+    $('shelf').classList.add('on');
+    S.view = 'shelf';
+    loadShelf(false);
+  });
+})();
+</script>
+</body>
+</html>

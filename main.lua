@@ -1,12 +1,16 @@
 --[[
 kremote.koplugin - 手机浏览器遥控 KOReader
 
-在 Kindle 上起一个极简 HTTP 服务，手机浏览器打开就能翻页、调字号、
-切夜间模式、看当前页码和电量。走局域网，不碰蓝牙、不碰内核、不需要 root。
+在 Kindle 上起一个极简 HTTP 服务，手机浏览器打开先看到书库（最近阅读轮播 +
+两行全部书籍），点一本书 Kindle 就跳到那本书；进控制页后能翻页、切章节、
+调字号、切夜间模式、调前光，并看到当前页码和电量。
+走局域网，不碰蓝牙、不碰内核、不需要 root。
 
 实现要点：
   * HTTP 层在 httpcore.lua，非阻塞 accept，由 UIManager:scheduleIn 驱动，
     不阻塞 KOReader 的事件循环
+  * 书库与封面在 library.lua：扫目录 + 读 history.lua + 查 CoverBrowser 的
+    SQLite 缓存，封面缩到 260px 宽转 JPEG 落盘，不做现场抽图
   * 翻页用 GotoViewRel 事件（ReaderRolling / ReaderPaging 都实现了），
     对 EPUB 和 PDF 都有效
   * 不干预自动休眠：Kindle 按自己的 30 分钟超时休眠。手机发来的翻页等
@@ -23,17 +27,36 @@ local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
--- 按本文件所在目录定位 httpcore.lua，不依赖 package.path 是否含插件目录。
+-- 按本文件所在目录定位附属文件（httpcore.lua / library.lua / panel.html），
+-- 不依赖 package.path 是否含插件目录和当前工作目录。
 -- 用 require("httpcore") 在部分启动路径下会找不到模块，这里更稳。
-local HttpCore = (function()
+local PLUGIN_DIR = (function()
     local src = debug.getinfo(1, "S").source or ""
-    local dir = src:match("^@(.*)/[^/]+$") or "."
-    local chunk, err = loadfile(dir .. "/httpcore.lua")
+    return src:match("^@(.*)/[^/]+$") or "."
+end)()
+
+local HttpCore = (function()
+    local chunk, err = loadfile(PLUGIN_DIR .. "/httpcore.lua")
     if not chunk then
         logger.err("kremote: cannot load httpcore.lua:", tostring(err))
         return nil
     end
     return chunk()
+end)()
+
+-- 书库扫描与封面导出。缺这个文件只是书架页用不了，控制页照旧。
+local Library = (function()
+    local chunk, err = loadfile(PLUGIN_DIR .. "/library.lua")
+    if not chunk then
+        logger.err("kremote: cannot load library.lua:", tostring(err))
+        return nil
+    end
+    local ok, mod = pcall(chunk)
+    if not ok or type(mod) ~= "table" then
+        logger.err("kremote: library.lua failed:", tostring(mod))
+        return nil
+    end
+    return mod
 end)()
 
 local PORT = 18080
@@ -58,235 +81,25 @@ local function basename(p)
 end
 
 ----------------------------------------------------------------------
--- 手机端面板（内联，避免额外文件依赖）
+-- 手机端面板
 ----------------------------------------------------------------------
 
-local PANEL = [==[<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#15171a">
-<title>Kindle 遥控</title>
-<style>
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;background:#15171a;color:#e8e6e1;
-  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;
-  -webkit-user-select:none;user-select:none;overscroll-behavior:none}
-/* 整页固定一屏高，flex 纵向排布：中间的翻页区吃掉剩余全部高度，
-   底部的章节按钮和提示文字贴着下沿，任何屏高都不出现滚动 */
-body{padding:14px 14px calc(10px + env(safe-area-inset-bottom));position:relative;
-  display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden}
-.hd{flex:0 0 auto;display:flex;justify-content:space-between;align-items:center;
-  font-size:12px;color:#8b8e94;letter-spacing:.02em;margin-bottom:6px}
-.hd-r{display:flex;align-items:center;gap:9px}
-.gear{width:34px;height:34px;padding:0;border-radius:10px;font-size:17px;line-height:1;
-  background:transparent;border:1px solid #2b3038;color:#8b8e94;flex:0 0 auto}
-.gear.open{background:#2f343b;color:#e8e6e1;border-color:#4a5058}
-h1{flex:0 0 auto;font-size:16px;font-weight:500;margin:0 0 3px;line-height:1.35;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sub{flex:0 0 auto;font-size:12px;color:#8b8e94;line-height:1.5}
-.bar{flex:0 0 auto;height:4px;background:#262a30;border-radius:2px;margin:12px 0;overflow:hidden}
-.bar>i{display:block;height:100%;width:0;background:#6fa8c8;border-radius:2px;transition:width .25s ease}
-button{background:#22252b;color:#e8e6e1;border:1px solid #33373e;border-radius:14px;
-  font-family:inherit;font-size:15px;padding:14px 8px;cursor:pointer;width:100%;
-  transition:background .12s ease,transform .06s ease}
-button:active{background:#2f343b;transform:scale(.975)}
-
-/* 亮度：左右各一个步进键，中间滑杆 */
-.lrow{flex:0 0 auto;display:flex;align-items:center;gap:9px;margin:0 0 10px;min-width:0}
-.lbtn{width:54px;height:54px;flex:0 0 auto;padding:0;border-radius:14px;
-  font-size:21px;line-height:1;color:#c9cdd3}
-/* min-width:0 是必须的：flex item 默认 min-width:auto，range 的固有宽度
-   会把整行撑得比视口还宽，右侧的「＋」和翻页键就被挤出屏幕 */
-.sl{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:10px;height:54px;
-  background:#22252b;border:1px solid #33373e;border-radius:14px;padding:0 15px}
-.lv{font-size:13px;color:#6fa8c8;width:2em;text-align:right;flex:0 0 auto;
-  font-variant-numeric:tabular-nums}
-input[type=range]{-webkit-appearance:none;appearance:none;flex:1 1 auto;min-width:0;
-  width:auto;height:4px;margin:0;background:#3a3f47;border-radius:2px;outline:none}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;
-  border-radius:50%;background:#e8e6e1;border:1px solid #15171a;cursor:pointer}
-input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
-  background:#e8e6e1;border:1px solid #15171a;cursor:pointer}
-
-/* 左右翻页：吃掉中间剩余的全部高度 */
-.turn{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:1fr 1fr;
-  grid-template-rows:1fr;gap:10px;margin-bottom:10px}
-.turn button{display:flex;align-items:center;justify-content:center;
-  font-size:clamp(28px,5.5vh,42px)}
-/* 上下章：紧贴底部提示文字，两者间距 10px */
-.chap{flex:0 0 auto;display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.chap button{height:54px;font-size:15px}
-
-/* 齿轮下拉 */
-.menu{position:absolute;right:14px;top:54px;min-width:160px;background:#22252b;
-  border:1px solid #3a3f47;border-radius:12px;padding:6px;display:none;z-index:50;
-  box-shadow:0 10px 28px rgba(0,0,0,.55)}
-.menu.show{display:block}
-.menu button{display:block;width:100%;text-align:left;font-size:14px;
-  padding:13px 15px;border:none;background:transparent;border-radius:8px}
-.menu button:active{background:#2f343b;transform:none}
-.menu hr{border:none;border-top:1px solid #33373e;margin:5px 8px}
-.tip{flex:0 0 auto;font-size:12px;color:#6c7076;line-height:1.6;margin:10px 0 0}
-/* 操作失败时的一次性提示（书架界面上翻页会走到这里） */
-.toast{position:fixed;left:50%;bottom:72px;transform:translateX(-50%) translateY(8px);
-  background:#2f343b;border:1px solid #4a5058;color:#e8e6e1;font-size:13px;
-  padding:10px 16px;border-radius:10px;opacity:0;pointer-events:none;z-index:80;
-  max-width:78vw;text-align:center;transition:opacity .18s ease,transform .18s ease}
-.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-</style>
-</head>
-<body>
-<div class="hd">
-  <span id="batt">电量 —</span>
-  <span class="hd-r">
-    <span id="pct">—</span>
-    <button class="gear" id="gear" aria-label="更多">⚙</button>
-  </span>
-</div>
-<h1 id="title">正在连接…</h1>
-<div class="sub" id="author"></div>
-<div class="bar"><i id="prog"></i></div>
-
-<div class="menu" id="menu">
-  <button data-act="night">夜间模式</button>
-  <button data-act="refresh">强制全刷</button>
-  <button data-act="font_dec">字号 －</button>
-  <button data-act="font_inc">字号 ＋</button>
-  <hr>
-  <button data-act="restart">重启</button>
-  <button data-act="quit">退出</button>
-</div>
-
-<div class="lrow" id="lrow">
-  <button class="lbtn" id="ldn" aria-label="减一档">－</button>
-  <div class="sl">
-    <input type="range" id="light" min="0" max="24" step="1" value="0">
-    <span class="lv" id="lv">–</span>
-  </div>
-  <button class="lbtn" id="lup" aria-label="加一档">＋</button>
-</div>
-
-<div class="turn">
-  <button id="prev" aria-label="上一页">◀</button>
-  <button id="next" aria-label="下一页">▶</button>
-</div>
-
-<div class="chap">
-  <button id="cp" data-act="chapter_prev">上一章</button>
-  <button id="cn" data-act="chapter_next">下一章</button>
-</div>
-
-<p class="tip">手机与 Kindle 需在同一个 Wi-Fi 下</p>
-<div class="toast" id="toast"></div>
-<script>
-(function(){
-  var $=function(id){return document.getElementById(id)};
-  var busy=false,lightBusy=false,lightTimer=null,toastTimer=null;
-  function toast(msg){
-    var t=$('toast');
-    t.textContent=msg;
-    t.classList.add('show');
-    clearTimeout(toastTimer);
-    toastTimer=setTimeout(function(){t.classList.remove('show')},1900);
-  }
-  function paint(s){
-    if(!s)return;
-    $('title').textContent=s.title||'(未打开书籍)';
-    $('author').textContent=s.authors||'';
-    $('pct').textContent=s.pages>0?(s.percent+'%  ·  '+s.page+'/'+s.pages):'—';
-    $('prog').style.width=Math.min(100,s.percent||0)+'%';
-    $('batt').textContent='电量 '+(s.battery<0?'—':s.battery+'%')+(s.charging?' ↯':'');
-    if(s.lightmax>0){
-      $('lrow').style.display='';
-      $('light').max=s.lightmax;
-      if(!lightBusy){$('light').value=s.light;$('lv').textContent=s.light;}
-    }else{
-      $('lrow').style.display='none';
-    }
-  }
-  function act(a){
-    if(busy)return;
-    busy=true;
-    if(a==='quit'||a==='restart'){
-      $('title').textContent=(a==='quit'?'正在退出…':'正在重启…');
-      $('author').textContent='Kindle 会断开连接，稍等几秒';
-    }
-    fetch('/api/'+a,{cache:'no-store'}).then(function(r){return r.json()})
-      .then(function(s){
-        busy=false;
-        // 409：服务在跑，但 Kindle 当前没有打开的书（书架界面）
-        if(s&&s.ok===0){toast(s.error||'操作失败');return;}
-        paint(s);
-      })
-      .catch(function(){busy=false;offline()});
-  }
-  function tick(){
-    fetch('/api/status',{cache:'no-store'}).then(function(r){return r.json()})
-      .then(paint).catch(offline);
-  }
-  function offline(){
-    $('title').textContent='连接已断开';
-    $('author').textContent='检查 Wi-Fi，或让 Kindle 亮屏后再试';
-  }
-
-  ['prev','next','cp','cn'].forEach(function(k){
-    var el=$(k);
-    if(el) el.onclick=function(){act(el.getAttribute('data-act')||k)};
-  });
-
-  // 齿轮下拉：点齿轮开关，点菜单内任意一项收起，点页面别处也收起
-  var menu=$('menu'),gear=$('gear');
-  function closeMenu(){menu.classList.remove('show');gear.classList.remove('open');}
-  gear.onclick=function(e){
-    e.stopPropagation();
-    var on=menu.classList.toggle('show');
-    gear.classList.toggle('open',on);
-  };
-  menu.addEventListener('click',function(e){e.stopPropagation();});
-  document.addEventListener('click',function(){closeMenu();});
-  Array.prototype.forEach.call(menu.querySelectorAll('button'),function(b){
-    b.onclick=function(e){
-      e.stopPropagation();
-      closeMenu();
-      act(b.getAttribute('data-act'));
-    };
-  });
-
-  // 亮度：滑杆拖动 180ms 防抖（逐格发会把 e-ink 的事件循环堵住），左右键每次 ±1
-  function pushLight(v){
-    lightBusy=true;
-    $('lv').textContent=v;
-    fetch('/api/light?n='+v,{cache:'no-store'})
-      .then(function(r){return r.json()})
-      .then(function(s){lightBusy=false;paint(s)})
-      .catch(function(){lightBusy=false;offline()});
-  }
-  $('light').oninput=function(){
-    lightBusy=true;
-    $('lv').textContent=$('light').value;
-    clearTimeout(lightTimer);
-    lightTimer=setTimeout(function(){pushLight($('light').value);},180);
-  };
-  function stepLight(d){
-    var max=parseInt($('light').max,10)||24;
-    var v=parseInt($('light').value,10)||0;
-    v=Math.max(0,Math.min(max,v+d));
-    $('light').value=v;
-    clearTimeout(lightTimer);
-    pushLight(v);
-  }
-  $('ldn').onclick=function(){stepLight(-1)};
-  $('lup').onclick=function(){stepLight(1)};
-
-  tick();
-  setInterval(tick,2000);
-})();
-</script>
-</body>
-</html>
-]==]
+-- 前端页面从 panel.html 读，不内联在 Lua 字符串里：
+-- 语法高亮、独立预览、改样式不用碰 Lua
+-- 首次请求时读一次并缓存（一次一屏，几百 KB 顶天）
+local panel_cache = nil
+local function getPanel()
+    if panel_cache then return panel_cache end
+    local f = io.open(PLUGIN_DIR .. "/panel.html", "rb")
+    if not f then
+        logger.err("kremote: cannot open panel.html")
+        return "<!DOCTYPE html><meta charset=utf-8>"
+            .. "<h1>面板文件缺失</h1><p>请重新安装插件。</p>"
+    end
+    panel_cache = f:read("*a")
+    f:close()
+    return panel_cache
+end
 
 ----------------------------------------------------------------------
 -- 前光
@@ -497,6 +310,8 @@ function KRemote:getStatus()
         ok = 1, title = "", authors = "",
         page = 0, pages = 0, percent = 0,
         battery = -1, charging = 0, night = 0,
+        -- 手机端据此决定显示书架页还是控制页
+        view = activeReader() and "reader" or "shelf",
     }
     local ui = activeReader()
     local doc = ui and ui.document
@@ -538,12 +353,96 @@ end
 function KRemote:statusJSON()
     local s = self:getStatus()
     return string.format(
-        '{"ok":1,"title":"%s","authors":"%s","page":%d,"pages":%d,'
+        '{"ok":1,"view":"%s","title":"%s","authors":"%s","page":%d,"pages":%d,'
         .. '"percent":%.1f,"battery":%d,"charging":%d,"night":%d,'
         .. '"light":%d,"lightmax":%d}',
-        json_escape(s.title), json_escape(s.authors),
+        s.view, json_escape(s.title), json_escape(s.authors),
         s.page, s.pages, s.percent, s.battery, s.charging, s.night,
         s.light, s.lightmax)
+end
+
+----------------------------------------------------------------------
+-- 书架
+----------------------------------------------------------------------
+
+local function bookJSON(b)
+    return string.format(
+        '{"h":"%s","t":"%s","a":"%s","p":%.1f,"c":%d}',
+        b.hash, json_escape(b.title), json_escape(b.authors),
+        b.percent or 0, b.has_cover and 1 or 0)
+end
+
+function KRemote:shelfJSON(force)
+    if not Library then
+        return '{"ok":0,"error":"缺少 library.lua，书架不可用"}'
+    end
+    local s = self:getStatus()
+    local data = Library.shelf(force)
+    local out = {
+        '{"ok":1,"view":"', s.view, '","battery":', tostring(s.battery),
+        ',"charging":', tostring(s.charging), ',"recent":[',
+    }
+    for i, b in ipairs(data.recent) do
+        if i > 1 then out[#out + 1] = "," end
+        out[#out + 1] = bookJSON(b)
+    end
+    out[#out + 1] = '],"books":['
+    for i, b in ipairs(data.books) do
+        if i > 1 then out[#out + 1] = "," end
+        out[#out + 1] = bookJSON(b)
+    end
+    out[#out + 1] = "]}"
+    return table.concat(out)
+end
+
+-- 从 Kindle 当前界面打开一本书
+--
+-- 真正打开文档会阻塞一两秒（解析文件、建立排版），不能直接在有 HTTP
+-- 连接时同步做：那样手机端会等到超时。所以这里只做存在性检查，然后
+-- 排一个延时任务，等响应发完之后再切书。
+local function scheduleOpenBook(path)
+    if type(path) ~= "string" or path == "" then return false, "路径为空" end
+    local okf, exists = pcall(function()
+        return require("ffi/util").fileExists(path)
+    end)
+    if okf and not exists then return false, "文件不存在" end
+
+    UIManager:scheduleIn(0.35, function()
+        local ui = activeReader()
+        local ok, err
+        if ui then
+            -- 已经在看书：就地切换文档，不新建 ReaderUI 实例
+            ok, err = pcall(ui.switchDocument, ui, path)
+        else
+            -- 在书架界面：走文件管理器正常的打开流程
+            ok, err = pcall(function()
+                local FileManager = require("apps/filemanager/filemanager")
+                local fm = FileManager.instance
+                if fm and type(fm.openFile) == "function" then
+                    fm:openFile(path)
+                    return
+                end
+                require("apps/reader/readerui"):showDocument(path)
+            end)
+        end
+        if not ok then
+            logger.warn("kremote: open book failed", tostring(err))
+        end
+    end)
+    return true
+end
+
+-- 关掉当前文档，退回书架（FileManager 一直在窗口栈下面，关掉就露出来）
+local function scheduleCloseToShelf()
+    if not activeReader() then return true end
+    UIManager:scheduleIn(0.35, function()
+        local ui = activeReader()
+        if not ui then return end
+        -- onCloseDocument 只注销 reader_ui 登记，不会停 HTTP 服务
+        local ok, err = pcall(ui.onClose, ui, true)
+        if not ok then logger.warn("kremote: onClose failed", tostring(err)) end
+    end)
+    return true
 end
 
 ----------------------------------------------------------------------
@@ -555,7 +454,7 @@ function KRemote:route(method, path, query)
         return 400, "text/plain; charset=utf-8", "only GET"
     end
     if path == "/" or path == "/index.html" then
-        return 200, "text/html; charset=utf-8", PANEL
+        return 200, "text/html; charset=utf-8", getPanel()
     end
     if path == "/favicon.ico" then
         return 204, "text/plain", ""
@@ -563,6 +462,67 @@ function KRemote:route(method, path, query)
     if path == "/api/status" then
         return 200, "application/json; charset=utf-8", self:statusJSON()
     end
+
+    -- 轻量状态：书架页轮询用，不带书名页码这些
+    if path == "/api/state" then
+        local s = self:getStatus()
+        return 200, "application/json; charset=utf-8", string.format(
+            '{"ok":1,"view":"%s","battery":%d,"charging":%d}',
+            s.view, s.battery, s.charging)
+    end
+
+    if path == "/api/shelf" then
+        local force = type(query) == "string" and query:find("r=1") ~= nil
+        local ok, json = pcall(self.shelfJSON, self, force)
+        if not ok then
+            logger.warn("kremote: shelf failed", tostring(json))
+            return 500, "application/json; charset=utf-8",
+                '{"ok":0,"error":"' .. json_escape(tostring(json)) .. '"}'
+        end
+        return 200, "application/json; charset=utf-8", json
+    end
+
+    if path == "/api/cover" then
+        local hash = query and query:match("h=([%w]+)")
+        local book = hash and Library and Library.findByHash(hash)
+        if not book then return 404, "text/plain; charset=utf-8", "no cover" end
+        local ok, data, ctype = pcall(Library.cover, book)
+        if not ok or not data then
+            return 404, "text/plain; charset=utf-8", "no cover"
+        end
+        -- 书籍路径以 hash 标识，封面内容只在书文件变动时才会变，可以放心缓存
+        return 200, ctype or "image/jpeg", data,
+            { "Cache-Control: max-age=86400", "X-Content-Type-Options: nosniff" }
+    end
+
+    if path == "/api/open" then
+        local hash = query and query:match("h=([%w]+)")
+        local book = hash and Library and Library.findByHash(hash)
+        if not book then
+            return 404, "application/json; charset=utf-8",
+                '{"ok":0,"error":"找不到这本书，请刷新书架"}'
+        end
+        -- 打开文档会阻塞一两秒，先让 HTTP 响应发出去再动手，
+        -- 否则手机端会看到连接被重置
+        local ok, opened, err = pcall(scheduleOpenBook, book)
+        if not ok or not opened then
+            return 500, "application/json; charset=utf-8",
+                '{"ok":0,"error":"' .. json_escape(tostring(err or opened)) .. '"}'
+        end
+        touchActivity()
+        return 200, "application/json; charset=utf-8", '{"ok":1,"opening":1}'
+    end
+
+    if path == "/api/home" then
+        local ok, done = pcall(scheduleCloseToShelf)
+        if not ok or not done then
+            return 500, "application/json; charset=utf-8",
+                '{"ok":0,"error":"返回书架失败"}'
+        end
+        touchActivity()
+        return 200, "application/json; charset=utf-8", '{"ok":1,"view":"shelf"}'
+    end
+
     local action = path:match("^/api/([%w_]+)$")
     if action and ACTIONS[action] then
         if DOC_ACTIONS[action] and not activeReader() then

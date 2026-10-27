@@ -19,8 +19,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build/kremote.koplugin
-          cp _meta.lua main.lua httpcore.lua build/kremote.koplugin/
-          cp README.md LICENSE build/kremote.koplugin/
+          # 白名单式拷贝容易漏文件（新增 panel.html / library.lua 时就漏过一次），
+          # 改成整目录同步再排除开发用的东西
+          rsync -a --exclude='.git' --exclude='.github' --exclude='tests' \
+                --exclude='docs' --exclude='build' \
+                ./ build/kremote.koplugin/
           cd build
           zip -r ../kremote.koplugin.zip kremote.koplugin
           cd ..

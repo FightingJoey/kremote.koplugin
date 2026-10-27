@@ -7,6 +7,11 @@ httpcore.lua - 极简非阻塞 HTTP/1.1 服务端
 
 被驱动方式：调用方周期性调 poll()，每次最多处理 max_per_poll 个连接。
 server socket 设为非阻塞，accept 立即返回，不会卡住 UI 事件循环。
+
+关于大响应（封面图）：
+LuaSocket 的 send 在超时模式下可能只发出一部分，直接 close 会让浏览器
+收到截断的图片。这里用循环把剩余字节发完，并把写超时放宽到 1 秒 ——
+封面图最大几十 KB，局域网上远用不到这么久。
 ]]
 
 local socket = require("socket")
@@ -17,18 +22,22 @@ HttpCore.__index = HttpCore
 local REASON = {
     [200] = "OK",
     [204] = "No Content",
+    [304] = "Not Modified",
     [400] = "Bad Request",
+    [403] = "Forbidden",
     [404] = "Not Found",
+    [405] = "Method Not Allowed",
+    [409] = "Conflict",
     [500] = "Internal Server Error",
 }
 
--- handler(method, path, query) -> code, content_type, body
+-- handler(method, path, query) -> code, content_type, body[, extra_headers]
 function HttpCore.new(port, handler, opts)
     opts = opts or {}
     return setmetatable({
         port = port,
         handler = handler,
-        max_per_poll = opts.max_per_poll or 4,
+        max_per_poll = opts.max_per_poll or 8,
         on_error = opts.on_error,
     }, HttpCore)
 end
@@ -58,17 +67,60 @@ local function parse_request_line(line)
     return method, path or target, query or ""
 end
 
-function HttpCore:respond(client, code, ctype, body)
+-- 把 data 全部写完；返回是否成功
+--
+-- 注意 LuaSocket 的语义：send(data, i) 里 i 是"起始字节索引"（1 起），
+-- 返回值 last 是"最后发出的字节索引"，partial 同样是索引而不是数量。
+-- 所以推进游标要用 last，不能拿返回值当已发包数去累加。
+local function send_all(client, data)
+    if type(data) ~= "string" or data == "" then return true end
+    local total = #data
+    local sent = 0
+    local guard = 0
+    while sent < total do
+        local last, err, partial = client:send(data, sent + 1)
+        if last then
+            sent = last
+        elseif type(partial) == "number" and partial > sent then
+            sent = partial
+        else
+            return false, err
+        end
+        guard = guard + 1
+        if guard > 200 then return false, "send stalled" end
+    end
+    return true
+end
+
+-- 包一层，避免 respond 里出错把连接状态搞乱
+local function send_packet(client, data)
+    local ok, err = pcall(send_all, client, data)
+    if not ok then return false, err end
+    return true
+end
+
+function HttpCore:respond(client, code, ctype, body, extra_headers, omit_body)
     body = body or ""
-    local head = string.format(
-        "HTTP/1.1 %d %s\r\n" ..
-        "Content-Type: %s\r\n" ..
-        "Content-Length: %d\r\n" ..
-        "Cache-Control: no-store, no-cache, must-revalidate\r\n" ..
-        "Pragma: no-cache\r\n" ..
-        "Connection: close\r\n\r\n",
-        code, REASON[code] or "OK", ctype or "text/plain; charset=utf-8", #body)
-    pcall(function() client:send(head .. body) end)
+    local head = {
+        string.format("HTTP/1.1 %d %s", code, REASON[code] or "OK"),
+        "Content-Type: " .. (ctype or "text/plain; charset=utf-8"),
+        "Content-Length: " .. tostring(#body),
+        "Connection: close",
+    }
+    if extra_headers then
+        for _, h in ipairs(extra_headers) do head[#head + 1] = h end
+    else
+        head[#head + 1] = "Cache-Control: no-store, no-cache, must-revalidate"
+        head[#head + 1] = "Pragma: no-cache"
+    end
+    local packet = table.concat(head, "\r\n") .. "\r\n\r\n"
+    -- 写超时放宽到 1 秒：读请求头用 0.25 秒够，写几十 KB 的图要更宽裕
+    pcall(function() client:settimeout(1, "b") end)
+    if omit_body then
+        send_packet(client, packet)   -- HEAD：头照发，body 不发
+    else
+        send_packet(client, packet .. body)
+    end
 end
 
 function HttpCore:serve(client)
@@ -84,13 +136,13 @@ function HttpCore:serve(client)
         if not l or l == "" then break end
         n = n + 1
     end
-    local ok, code, ctype, body = pcall(self.handler, method, path, query)
+    local ok, code, ctype, body, extra = pcall(self.handler, method, path, query)
     if not ok then
         if self.on_error then self.on_error(code) end
         self:respond(client, 500, "text/plain; charset=utf-8", "internal error")
         return
     end
-    self:respond(client, code, ctype, body)
+    self:respond(client, code, ctype, body, extra, method == "HEAD")
 end
 
 function HttpCore:poll()

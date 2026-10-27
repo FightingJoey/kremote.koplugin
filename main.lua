@@ -86,11 +86,15 @@ end
 
 -- 前端页面从 panel.html 读，不内联在 Lua 字符串里：
 -- 语法高亮、独立预览、改样式不用碰 Lua
--- 首次请求时读一次并缓存（一次一屏，几百 KB 顶天）
+-- 按 mtime 缓存：改完 HTML 刷新页面就生效，不必重启 KOReader 重新加载插件
 local panel_cache = nil
+local panel_stamp = nil
 local function getPanel()
-    if panel_cache then return panel_cache end
-    local f = io.open(PLUGIN_DIR .. "/panel.html", "rb")
+    local path = PLUGIN_DIR .. "/panel.html"
+    local lfs_ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    local stamp = lfs_ok and lfs.attributes(path, "modification") or nil
+    if panel_cache and stamp and stamp == panel_stamp then return panel_cache end
+    local f = io.open(path, "rb")
     if not f then
         logger.err("kremote: cannot open panel.html")
         return "<!DOCTYPE html><meta charset=utf-8>"
@@ -98,6 +102,7 @@ local function getPanel()
     end
     panel_cache = f:read("*a")
     f:close()
+    panel_stamp = stamp
     return panel_cache
 end
 
@@ -249,6 +254,15 @@ local ACTIONS = {
     end,
     -- 重启/退出都必须等 HTTP 响应发出去再动手：handler 返回后 httpcore 才 send，
     -- 在这里同步执行会让手机收到连接重置，看不到任何结果
+    --
+    -- 休眠同理：UIManager:suspend() 触发 powerd 挂起，Wi-Fi 随即断开，
+    -- 手机端连响应都收不到。延后一点，让它先把 ok 发回去。
+    suspend = function()
+        UIManager:scheduleIn(0.6, function()
+            local ok, err = pcall(function() UIManager:suspend() end)
+            if not ok then logger.warn("kremote: suspend failed", tostring(err)) end
+        end)
+    end,
     restart = function()
         UIManager:scheduleIn(0.6, function()
             -- koreader.sh 里有 `while [ RETURN_VALUE -eq 85 ]` 循环，quit(85) 会被它
@@ -257,6 +271,16 @@ local ACTIONS = {
             -- 之前试过"先 quit 再用 kpm launch --asap 外部拉起"，在 Kindle 上不可靠：
             -- reader.lua 一退出 koreader.sh 就结束了，Amazon 框架随即恢复，这时再拉
             -- KOReader 等于跑在框架底下，会被抢焦点甚至直接被收掉。
+            --
+            -- 重启前先补齐 /var/tmp/koreader.sh：新起的 reader.lua 会拿它和目录里的
+            -- 脚本比 md5，缺了这个副本就当作"启动脚本已更新"，在启动早期弹出
+            -- "需要完全退出 KOReader 来完成更新"的对话框并卡在那里（真机上遇到过，
+            -- 表现为服务一直起不来、屏幕停在确认框）。补一次是无害的幂等操作。
+            pcall(function()
+                local dir = require("datastorage"):getDataDir()
+                os.execute("cp -pf " .. dir .. "/koreader.sh /var/tmp/koreader.sh 2>/dev/null; "
+                    .. "chmod 777 /var/tmp/koreader.sh 2>/dev/null")
+            end)
             if type(UIManager.restartKOReader) == "function" then
                 local ok = pcall(function() UIManager:restartKOReader() end)
                 if ok then return end

@@ -210,6 +210,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
     <button data-act="font_dec">字号 －</button>
     <button data-act="font_inc">字号 ＋</button>
     <hr>
+    <button data-act="suspend">休眠</button>
     <button data-act="restart">重启</button>
     <button data-act="quit">退出</button>
   </div>
@@ -261,7 +262,9 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
     busy: false,
     lightBusy: false,
     lightTimer: null,
-    toastTimer: null
+    toastTimer: null,
+    asleep: false,       // 主动点了"休眠"：期间连不上是预期，别报断线
+    asleepAt: 0          // 点休眠的时刻，提示至少停留 5 秒
   };
 
   /* ───────── 小工具 ───────── */
@@ -282,6 +285,18 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
     if (S.view === 'reader'){
       $('title').textContent = '连接已断开';
       $('author').textContent = '检查 Wi-Fi，或让 Kindle 亮屏后再试';
+    }
+  }
+
+  // 休眠后 Kindle 会熄屏、多半还会断 Wi-Fi，手机这时连不上是预期的，
+  // 不要把它说成"连接已断开"。有些机器休眠时保留 Wi-Fi（觅阅默认如此），
+  // 服务还能应答，那就让提示停 5 秒再恢复正常显示，免得闪一下就没了。
+  function sleepPrompt(){
+    S.asleep = true;
+    S.asleepAt = Date.now();
+    if (S.view === 'reader'){
+      $('title').textContent = 'Kindle 已休眠';
+      $('author').textContent = '按电源键唤醒，恢复后这边自动接上';
     }
   }
 
@@ -575,6 +590,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
 
   function paint(s){
     if (!s) return;
+    if (S.asleep) return;   // 休眠提示优先，别让轮询把标题刷回书名
     $('title').textContent = s.title || '(未打开书籍)';
     $('author').textContent = s.authors || '';
     $('pct').textContent = s.pages > 0 ? (s.percent + '%  ·  ' + s.page + '/' + s.pages) : '—';
@@ -595,14 +611,24 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
     if (a === 'quit' || a === 'restart'){
       $('title').textContent = (a === 'quit' ? '正在退出…' : '正在重启…');
       $('author').textContent = 'Kindle 会断开连接，稍等几秒';
+    } else if (a === 'suspend'){
+      sleepPrompt();
     }
     fetch('/api/' + a, {cache:'no-store'}).then(function(r){ return r.json(); })
       .then(function(s){
         S.busy = false;
-        if (s && s.ok === 0){ toast(s.error || '操作失败'); return; }
+        if (s && s.ok === 0){
+          S.asleep = false;       // 没睡成，把书名还回去
+          paint(s);
+          toast(s.error || '操作失败');
+          return;
+        }
         paint(s);
       })
-      .catch(function(){ S.busy = false; offline(); });
+      .catch(function(){
+        S.busy = false;
+        if (!S.asleep) offline();
+      });
   }
 
   function tick(){
@@ -611,6 +637,14 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
       S.fails = 0;
       if (!s) return;
       S.kindleView = s.view;
+      // 睡着的 Kindle 又连上了：撤掉休眠提示，恢复正常显示
+      // （保留 5 秒，让"已休眠"能被看见，别一闪而过）
+      if (S.asleep){
+        if (Date.now() - (S.asleepAt || 0) < 5000) return;
+        S.asleep = false;
+        paint(s);
+        return;
+      }
       // 正在开书：Kindle 还没切过去，这时 status 仍是 shelf，
       // 直接 paint 会把书名刷空、还会误判成"用户关书了"
       if (S.busy) return;
@@ -623,6 +657,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
       }
       paint(s);
     }).catch(function(){
+      if (S.asleep) return;   // 休眠期间连不上是意料之中
       // 单次失败不算断线：退回书架 / 开书时 Kindle 要重建整个书架界面，
       // HTTP 服务可能跟着重启一两秒（实测 1~3 秒），这时请求会打空。
       // 连续失败 3 次（约 6 秒）才认定真的连不上。

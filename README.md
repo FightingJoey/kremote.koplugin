@@ -29,7 +29,7 @@ Kindle 的蓝牙栈只注册了 A2DP/HFP 音频 profile，没有 SPP 串口服�
 | 显示 | 夜间模式、强制全刷 |
 | 前光 | 0–24 档亮度滑杆，支持左右步进键 |
 | 状态 | 书名、作者、当前页/总页、百分比、电量、充电态、亮度档位，每 2 秒自动刷新 |
-| 系统 | 重启 KOReader、退出 KOReader |
+| 系统 | 休眠（等同按电源键，唤醒后自动重连）、重启 KOReader、退出 KOReader |
 | 菜单 | 启动/停止服务、显示访问地址、开机自动启动 |
 
 > 装了「觅阅」（MiuRead）这类带自己桌面的定制版时，手机点返回会让 Kindle 回到**觅阅桌面**，而不是 KOReader 的文件浏览器——返回动作走的是觅阅自己的 `return_to_miuread_home()`，它负责关文档、重建底下的 FileManager、再把桌面抬回来。原版 KOReader 没有这层桌面，返回的仍然是文件管理器。
@@ -111,6 +111,7 @@ iptables -I INPUT 1 -i wlan0 -p tcp --dport 18080 -m conntrack --ctstate NEW -j 
 | GET | `/api/night` | 切换夜间模式 |
 | GET | `/api/refresh` | 强制全刷 |
 | GET | `/api/light?n=12` | 设置前光档位（0–24，超范围自动夹取） |
+| GET | `/api/suspend` | 休眠（发完响应 0.6s 后才真正挂起，Wi-Fi 随之断开） |
 | GET | `/api/restart` | 重启 KOReader |
 | GET | `/api/quit` | 退出 KOReader |
 
@@ -189,7 +190,8 @@ python3 tests/mock_shelf.py
 - **封面质量**：优先用 CoverBrowser 已经缩好的缓存；缓存里的图太小时（实测有些只有 47×62，手机上会糊）会现场开文档抽一次原图，
   再缩到 260px 宽存成 JPEG。所以第一次翻到某本书时可能要等一两秒，之后走磁盘缓存，几十毫秒。
 - **无鉴权**。同一 Wi-Fi 下任何人知道 IP 就能翻你的书。自己家里用没问题，公共网络下建议改成手动启动而不是自动启动。要加 token 鉴权的话，改动很小。
-- **休眠后连不上**。Kindle 休眠会断 Wi-Fi，碰一下设备唤醒即可，服务会跟着进程一起回来（`onResume` 会补防火墙规则）。这条路径在真实休眠/唤醒循环下的表现还没做过严格验证。
+- **休眠后连不上**。Kindle 休眠会断 Wi-Fi，碰一下设备唤醒即可，服务会跟着进程一起回来（`onResume` 会补防火墙规则）。实测手机端点「休眠」后日志出现 `power suspend mode = REAL_SUSPEND`，约 3 分钟后按电源键唤醒，端口立即恢复应答。网页在休眠期间显示「Kindle 已休眠」而不是「连接已断开」，唤醒后自动回到正常显示。
+- **休眠不换屏保**。KOReader 运行时 Amazon 框架停着，没有东西画屏保，设备会停在最后那屏（书页）上熄屏。这是 KOReader 自身的行为，不是插件能决定的；想要休眠有图，在 KOReader 的「屏幕 → 休眠屏保」里设置。
 - **只覆盖 KOReader**。原生阅读器界面不归它管。
 
 ## 卸载

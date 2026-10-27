@@ -608,8 +608,11 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
     api('/api/status').then(function(s){
       if (!s) return;
       S.kindleView = s.view;
+      // 正在开书：Kindle 还没切过去，这时 status 仍是 shelf，
+      // 直接 paint 会把书名刷空、还会误判成"用户关书了"
+      if (S.busy) return;
       // Kindle 那边关书退回书架了：网页也跟着回书架
-      if (s.view === 'shelf' && !S.busy){
+      if (s.view === 'shelf'){
         S.shelfLoaded = false;
         switchTo('shelf');
         loadShelf(true);

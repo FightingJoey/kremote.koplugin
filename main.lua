@@ -200,6 +200,62 @@ local function miuReadPlugin()
     return nil
 end
 
+-- 清掉觅阅残留的"显式返回"状态
+--
+-- 觅阅的返回流程是一个跨界面的状态机：return_requested 一旦置位，它会盯住
+-- 那本书的 Reader，只要 Reader 又出现就当作"返回没关干净又冒出来"，立刻
+-- 再关一次（日志：reader reappeared during explicit return）。正常收尾要靠
+-- HomeView 顺利抬起后清标志；如果收尾被打断（返回途中设备休眠、桌面重建、
+-- 插件在关闭过程中重新初始化），这个标志会一直挂着。
+--
+-- 后果就是：之后从手机点开同一本书，进去一两秒就被它关掉，网页看起来
+-- "自己弹回书架"。用户此刻明确要打开这本书，等于放弃之前那次返回请求，
+-- 所以开书前把残留清掉。
+local function clearMiuReadStaleReturn()
+    local hs = rawget(_G, "__MIUREAD_HOME_SESSION")
+    local rc = rawget(_G, "__MIUREAD_READER_CLOSE")
+    local cleared = false
+
+    if type(rc) == "table" and tostring(rc.state or "idle") ~= "idle" then
+        -- reader_close_active() 只看 state 是否 idle/completed/failed，
+        -- 标成 completed 就等于告诉觅阅"这次返回已经结束了"。
+        rc.state = "completed"
+        rc.close_event_received = true
+        -- 递增 generation：它所有延时的收尾回调里都会先比对 generation，
+        -- 对不上就自行失效，不会再来关我们刚打开的书。
+        rc.generation = (tonumber(rc.generation) or 0) + 1
+        cleared = true
+    end
+
+    if type(hs) == "table" then
+        if hs.return_requested == true or hs.return_target ~= nil then cleared = true end
+        hs.return_requested = false
+        hs.return_session_generation = 0
+        hs.return_request_file = nil
+        hs.return_target = nil
+        -- suspended 只在设备真睡着时该为 true。我们能收到开书请求说明设备
+        -- 醒着，残留值会把觅阅的导航态钉死在 suspended（返回流程也收不了尾）。
+        if hs.suspended == true then
+            hs.suspended = false
+            cleared = true
+        end
+    end
+
+    if cleared then
+        -- 实例上还有一份缓存副本，_navigation_state() 读的是它
+        local ok, loader = pcall(require, "pluginloader")
+        if ok and type(loader) == "table" and type(loader.loaded_plugins) == "table" then
+            for _, inst in pairs(loader.loaded_plugins) do
+                if type(inst) == "table" and inst._miuread_suspended == true then
+                    inst._miuread_suspended = false
+                end
+            end
+        end
+        logger.info("kremote: cleared stale MiuRead return state")
+    end
+    return cleared
+end
+
 -- 觅阅桌面此刻是否显示着。它底下通常还压着一个 FileManager，所以这可以
 -- 当作"界面还在，别停服务"的依据。
 local function miuHomeShown()
@@ -526,6 +582,9 @@ local function scheduleOpenBook(path)
     if okf and not exists then return false, "文件不存在" end
 
     UIManager:scheduleIn(0.35, function()
+        -- 开书前先清掉觅阅可能残留的返回状态，否则它会把这本书当成
+        -- "返回途中又冒出来的 Reader"，打开一两秒就再关掉。
+        pcall(clearMiuReadStaleReturn)
         local ui = activeReader()
         local ok, err
         if ui then

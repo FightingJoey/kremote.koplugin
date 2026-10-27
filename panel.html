@@ -264,7 +264,8 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
     lightTimer: null,
     toastTimer: null,
     asleep: false,       // 主动点了"休眠"：期间连不上是预期，别报断线
-    asleepAt: 0          // 点休眠的时刻，提示至少停留 5 秒
+    asleepAt: 0,         // 点休眠的时刻，提示至少停留 5 秒
+    shelfHits: 0         // 连续几次看到 Kindle 在书架：连续两次才跳回书架页
   };
 
   /* ───────── 小工具 ───────── */
@@ -535,6 +536,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
           return;
         }
         // Kindle 打开文档要一两秒，这里切到控制页并等状态变成 reader
+        S.shelfHits = 0;
         switchTo('reader');
         $('title').textContent = b.t || '';
         $('author').textContent = b.a || '';
@@ -648,13 +650,20 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
       // 正在开书：Kindle 还没切过去，这时 status 仍是 shelf，
       // 直接 paint 会把书名刷空、还会误判成"用户关书了"
       if (S.busy) return;
-      // Kindle 那边关书退回书架了：网页也跟着回书架
+      // Kindle 那边关书退回书架了：网页也跟着回书架。
+      // 但"关书→重建桌面"中间会短暂回报 shelf（尤其是觅阅要重排桌面），
+      // 单次命中就跳页会让人看到"刚进去就被弹出来"。连续两次（约 2 秒）
+      // 才认定用户真的退出了。
       if (s.view === 'shelf'){
+        S.shelfHits = (S.shelfHits || 0) + 1;
+        if (S.shelfHits < 2) return;
+        S.shelfHits = 0;
         S.shelfLoaded = false;
         switchTo('shelf');
         loadShelf(true);
         return;
       }
+      S.shelfHits = 0;
       paint(s);
     }).catch(function(){
       if (S.asleep) return;   // 休眠期间连不上是意料之中
